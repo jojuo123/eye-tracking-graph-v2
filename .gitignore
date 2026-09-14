@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+work_dir/
+*.pt
+*.pth
+*.h5
+.ipynb_checkpoints/
+erda/
+erda2/
+.claude/

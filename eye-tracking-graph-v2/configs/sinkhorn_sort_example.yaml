@@ -1,0 +1,72 @@
+# Sequence-reordering example: a Gumbel-Sinkhorn network (`modules/sinkhorn.py`)
+# recovers the correct order of a shuffled sequence of (2D coordinate, image
+# patch) pairs. Runs out of the box on synthetic data (see
+# `dataloaders/patch_sequence_dataset.py`):
+#   python main.py --config configs/sinkhorn_sort_example.yaml
+
+work_dir: ./work_dir/sinkhorn_sort_example
+seed: 42
+device: cuda   # falls back to cpu automatically if CUDA is unavailable
+monitor_metric: exact_match
+monitor_mode: max
+max_checkpoints: 5
+
+model:
+  type: sinkhorn_patch_sorter
+  in_channels: 3
+  coord_dim: 2
+  embed_dim: 128
+  encoder_cfg:
+    type: simple_cnn   # swap for "resnet" or "vit" (see modules/encoders.py) with no other change
+    channels: [32, 64, 128]
+  n_heads: 4
+  n_layers: 4
+  dropout: 0.1
+  sinkhorn_cfg:
+    tau: 0.5
+    n_iters: 20
+    noise_factor: 1.0
+    n_samples: 5
+  metrics_cfg:
+    - type: permutation_accuracy
+    - type: exact_match
+
+data:
+  train_dataset:
+    type: synthetic_patch_sequence
+    num_samples: 4000
+    seq_len: 6
+    patch_size: 8
+    in_channels: 3
+    seed: 0
+  train_loader:
+    batch_size: 64
+    shuffle: true
+    num_workers: 2
+
+  val_dataset:
+    type: synthetic_patch_sequence
+    num_samples: 800
+    seq_len: 6
+    patch_size: 8
+    in_channels: 3
+    seed: 1
+  val_loader:
+    batch_size: 128
+    shuffle: false
+    num_workers: 2
+
+optimizer:
+  type: adamw
+  lr: 0.0003
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  T_max: 20
+
+trainer:
+  type: example_trainer
+  num_epochs: 20
+  log_interval: 10
+  grad_clip_norm: 1.0

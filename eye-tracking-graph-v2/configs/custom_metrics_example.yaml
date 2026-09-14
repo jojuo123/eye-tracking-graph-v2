@@ -1,0 +1,71 @@
+# Same experiment as configs/default.yaml, but logs a richer set of metrics
+# (precision/recall/f1/top-k accuracy alongside accuracy) via config only --
+# no model code change needed. Demonstrates the `name` alias for reusing the
+# same metric type ("topk_accuracy") with different kwargs.
+#   python main.py --config configs/custom_metrics_example.yaml
+
+work_dir: ./work_dir/custom_metrics_example
+seed: 42
+device: cuda   # falls back to cpu automatically if CUDA is unavailable
+monitor_metric: accuracy
+monitor_mode: max
+max_checkpoints: 5
+
+model:
+  type: mlp_classifier
+  in_dim: 32
+  hidden_dims: [128, 128]
+  num_classes: 10
+  dropout: 0.1
+  metrics_cfg:
+    - type: accuracy
+    - type: precision
+      num_classes: 10
+    - type: recall
+      num_classes: 10
+    - type: f1
+      num_classes: 10
+    - type: topk_accuracy
+      k: 1
+      name: top1_accuracy
+    - type: topk_accuracy
+      k: 3
+      name: top3_accuracy
+
+data:
+  train_dataset:
+    type: synthetic_classification
+    num_samples: 4000
+    in_dim: 32
+    num_classes: 10
+    seed: 0
+  train_loader:
+    batch_size: 64
+    shuffle: true
+    num_workers: 2
+
+  val_dataset:
+    type: synthetic_classification
+    num_samples: 800
+    in_dim: 32
+    num_classes: 10
+    seed: 1
+  val_loader:
+    batch_size: 128
+    shuffle: false
+    num_workers: 2
+
+optimizer:
+  type: adamw
+  lr: 0.001
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  T_max: 10
+
+trainer:
+  type: example_trainer
+  num_epochs: 10
+  log_interval: 10
+  grad_clip_norm: 1.0
