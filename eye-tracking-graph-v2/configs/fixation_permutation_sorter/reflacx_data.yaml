@@ -46,4 +46,4 @@ soft_ground_truth:
 # Whether a dataset built via `data.reflacx.reflacx.dataset_kwargs` should load the
 # precomputed `soft_permutation` matrix (requires `soft_ground_truth.enabled` to have been
 # true when the H5 file was written).
-load_soft_permutation: false
+load_soft_permutation: true

@@ -30,7 +30,8 @@ def _valid_mean(values, mask):
 
 def permutation_to_matrix(perm, num_positions=None, mask=None):
     """Builds the `(B, N, N)` hard permutation matrix a `(B, N)` integer `perm` implies
-    (`matrix[b, i, perm[b, i]] = 1`), for use as the target in `DoublyStochasticCrossEntropyLoss`.
+    (`matrix[b, i, perm[b, i]] = 1`), for use as the target in `PermutationLoss` or
+    `DoublyStochasticCrossEntropyLoss`.
 
     Padded rows (`mask[b, i]` False, or `perm[b, i] < 0` if `mask` isn't given -- matching
     `PermutedFixationH5Dataset.collate_fn`'s `-1` padding) get an identity row instead
@@ -121,41 +122,69 @@ class PermutationWassersteinLoss(nn.Module):
 
 @LOSSES.register("permutation")
 class PermutationLoss(nn.Module):
-    """Row-wise negative log-likelihood of the ground-truth target column under the
-    predicted doubly-stochastic matrix's rows, treated as per-row categorical
-    distributions -- the loss `SinkhornPatchSorter` computes inline; provided here as a
-    reusable, masking-aware building block. Mathematically identical to
-    `DoublyStochasticCrossEntropyLoss` whenever its target matrix is the hard one-hot
-    permutation matrix `permutation_to_matrix` builds -- this version is the cheaper,
-    integer-indexed way to compute the same thing.
+    """The "permutation loss" of Wang, Yan & Yang, "Learning Combinatorial Embedding
+    Networks for Deep Graph Matching", ICCV 2019, Sec. 3.6 ("Permutation Cross-Entropy
+    Loss"), Eq. (17):
+
+        L_perm = -sum_{i, j} ( S^gt_ij * log(S_ij) + (1 - S^gt_ij) * log(1 - S_ij) )
+
+    i.e. *element-wise* binary cross-entropy between the predicted doubly-stochastic
+    matrix `S` and the target matrix `S^gt` (typically the hard one-hot permutation matrix
+    from `permutation_to_matrix`, but the paper's derivation only needs `S^gt` to be
+    non-negative -- REFLACX's soft ground truth, `data.reflacx.reflacx.
+    compute_soft_ground_truth`, also works). This is *not* the same as `PermutationLoss`
+    treating rows as categorical distributions (that's `DoublyStochasticCrossEntropyLoss`,
+    below): the negative term `(1 - S^gt_ij) * log(1 - S_ij)` additionally pushes every
+    *non*-target entry of a row towards 0, not just the target entry towards 1.
+
+    Following the reference implementation (github.com/Thinklab-SJTU/ThinkMatch), each
+    row's BCE terms are *summed* over columns, and that per-row sum is then averaged over
+    valid rows (via `_valid_mean`) -- not averaged over columns too -- so the loss scales
+    with how spread out a row's incorrect mass is, not just whether the argmax is right.
     """
 
-    def __init__(self, eps=1e-20):
+    def __init__(self, eps=1e-12):
         super().__init__()
         self.eps = eps
 
-    def forward(self, soft_perm, target_perm, mask=None):
+    def forward(self, predicted, target, mask=None):
         """
         Args:
-            soft_perm: `(B, N, N)` doubly-stochastic matrix.
-            target_perm: `(B, N)` integer target column per row; padded rows may hold any
-                value since `mask` excludes them.
-            mask: `(B, N)` bool, True at valid (non-padded) rows.
+            predicted: `(B, N, N)` doubly-stochastic matrix (`S`).
+            target: `(B, N, N)` target matrix (`S^gt`), e.g.
+                `permutation_to_matrix(perm, mask=mask)`.
+            mask: `(B, N)` bool, True at valid (non-padded) rows -- also used to exclude
+                padded *columns* from each valid row's sum, since this loss (unlike the
+                others in this module) touches every entry of the matrix, not just the
+                target column per row.
         """
-        n = soft_perm.shape[-1]
-        safe_target = target_perm.clamp(min=0, max=n - 1)
-        log_probs = torch.log(soft_perm.clamp_min(self.eps))
-        nll = -log_probs.gather(-1, safe_target.unsqueeze(-1)).squeeze(-1)  # (B, N)
-        return _valid_mean(nll, mask)
+        # Clamp each log's argument separately (not `predicted` itself, e.g. via
+        # `.clamp(eps, 1 - eps)`): in float32, `1 - eps` for a small `eps` can round back to
+        # exactly `1.0`, making `log(1 - predicted)` = `log(0)` = `-inf` at a target-1 entry
+        # -- multiplied by that entry's `(1 - target) == 0` weight, IEEE float arithmetic
+        # gives `0 * -inf = NaN`, not the mathematically-intended 0.
+        positive_term = target * torch.log(predicted.clamp_min(self.eps))
+        negative_term = (1 - target) * torch.log((1 - predicted).clamp_min(self.eps))
+        bce = -(positive_term + negative_term)
+        if mask is not None:
+            valid_pair = mask.unsqueeze(2) & mask.unsqueeze(1)  # (B, N, N)
+            bce = bce * valid_pair.to(bce.dtype)
+        per_row = bce.sum(dim=-1)  # (B, N)
+        return _valid_mean(per_row, mask)
 
 
 @LOSSES.register("doubly_stochastic_cross_entropy")
 class DoublyStochasticCrossEntropyLoss(nn.Module):
-    """Element-wise cross-entropy between a target doubly-stochastic matrix (typically the
-    hard, one-hot permutation matrix from `permutation_to_matrix`, but any valid
-    row-stochastic target works, e.g. label-smoothed targets) and the predicted one: per
-    row `i`, `-sum_j target[b, i, j] * log(predicted[b, i, j])`. Reduces to `PermutationLoss`
-    exactly when `target` is a hard one-hot permutation matrix.
+    """Element-wise *categorical* cross-entropy between a target doubly-stochastic matrix
+    (typically the hard, one-hot permutation matrix from `permutation_to_matrix`, but any
+    valid row-stochastic target works, e.g. label-smoothed targets) and the predicted one:
+    per row `i`, `-sum_j target[b, i, j] * log(predicted[b, i, j])`.
+
+    Unlike `PermutationLoss` (Wang, Yan & Yang, ICCV 2019's element-wise *binary*
+    cross-entropy, which also penalizes non-target entries via a `(1 - target) * log(1 -
+    predicted)` term), this only scores the target entries -- the more standard
+    "cross-entropy against a soft label" loss, and *not* the same value even when `target`
+    is a hard one-hot matrix.
     """
 
     def __init__(self, eps=1e-20):

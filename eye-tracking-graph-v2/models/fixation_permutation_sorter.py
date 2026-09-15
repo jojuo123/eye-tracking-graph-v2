@@ -105,6 +105,14 @@ class FixationPermutationSorter(BaseModel):
                 combination of several (`"name"` disambiguates using the same type twice,
                 e.g. two `"permutation_wasserstein"` terms with different `ground_metric`).
                 Defaults to a single `{"type": "permutation", "weight": 1.0}`.
+
+                `"permutation"`/`"doubly_stochastic_cross_entropy"` entries additionally
+                take a `"target"`: `"auto"` (default) uses the batch's `soft_permutation`
+                (see `data.reflacx.reflacx.compute_soft_ground_truth`) when present, else
+                falls back to the hard one-hot matrix; `"hard"`/`"soft"` force one or the
+                other regardless of what's in the batch (`"soft"` raises if the batch has
+                no `soft_permutation`) -- e.g. to isolate the hard-target case in an
+                ablation even when the dataset also loads the soft ground truth.
             metrics_cfg: which of `_METRIC_TYPES` (`"permutation_accuracy"`,
                 `"fixation_sequence_mse"`) to compute, as a list of names. Defaults to both.
         """
@@ -133,7 +141,7 @@ class FixationPermutationSorter(BaseModel):
         self.sinkhorn = GumbelSinkhorn(**(sinkhorn_cfg or {}))
 
         loss_cfg = loss_cfg or [{"type": "permutation", "weight": 1.0}]
-        self.loss_terms = []  # list of (name, weight, loss_type), modules live in loss_modules
+        self.loss_terms = []  # list of (name, weight, loss_type, target_mode)
         self.loss_modules = nn.ModuleDict()
         for term_cfg in loss_cfg:
             term_cfg = dict(term_cfg)
@@ -142,10 +150,14 @@ class FixationPermutationSorter(BaseModel):
                 raise ValueError(f"loss_cfg entry type must be one of {_LOSS_TYPES}, got {loss_type!r}")
             weight = term_cfg.pop("weight", 1.0)
             name = term_cfg.pop("name", None) or loss_type
+            target_mode = term_cfg.pop("target", "auto")
+            if loss_type in ("permutation", "doubly_stochastic_cross_entropy"):
+                if target_mode not in ("auto", "hard", "soft"):
+                    raise ValueError(f"target must be 'auto', 'hard', or 'soft', got {target_mode!r}")
             if name in self.loss_modules:
                 raise ValueError(f"duplicate loss name {name!r} -- pass a distinct 'name' for each occurrence")
             self.loss_modules[name] = build_loss({"type": loss_type, **term_cfg})
-            self.loss_terms.append((name, weight, loss_type))
+            self.loss_terms.append((name, weight, loss_type, target_mode))
 
         metrics_cfg = list(metrics_cfg) if metrics_cfg is not None else list(_METRIC_TYPES)
         unknown = set(metrics_cfg) - set(_METRIC_TYPES)
@@ -216,12 +228,20 @@ class FixationPermutationSorter(BaseModel):
 
         total = soft_perm.new_zeros(())
         breakdown = {}
-        for name, weight, loss_type in self.loss_terms:
+        for name, weight, loss_type, target_mode in self.loss_terms:
             loss_fn = self.loss_modules[name]
-            if loss_type in ("permutation", "permutation_wasserstein"):
+            if loss_type == "permutation_wasserstein":
                 value = loss_fn(soft_perm, tiled_perm, mask=tiled_mask)
-            elif loss_type == "doubly_stochastic_cross_entropy":
-                if soft_permutation_target is not None:
+            elif loss_type in ("permutation", "doubly_stochastic_cross_entropy"):
+                if target_mode == "hard":
+                    target_matrix = permutation_to_matrix(tiled_perm, mask=tiled_mask)
+                elif target_mode == "soft":
+                    assert soft_permutation_target is not None, (
+                        f"loss {name!r} has target='soft' but the batch has no 'soft_permutation' "
+                        "(set load_soft_permutation=True on the dataset)"
+                    )
+                    target_matrix = tile(soft_permutation_target)
+                elif soft_permutation_target is not None:
                     target_matrix = tile(soft_permutation_target)
                 else:
                     target_matrix = permutation_to_matrix(tiled_perm, mask=tiled_mask)
