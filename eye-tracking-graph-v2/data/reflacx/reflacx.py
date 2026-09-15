@@ -95,7 +95,13 @@ def preprocess(metadata_paths=METADATA, resize=RESIZE, normalize=NORMALIZE, to_h
 
                 if to_h5:
                     metadata['N_fixations'] = len(fixations.index)
-                    write_h5(h5file, group, 'metadata', metadata.to_numpy(), attrs={col: type(val).__name__ for col, val in metadata.items()})
+                    # Build a single-row DataFrame (rather than metadata.to_numpy()) so each
+                    # column keeps its own native dtype -- a mixed-type Series would otherwise
+                    # collapse to a generic object array, and per-column HDF5 datasets (like
+                    # fixations below) let a reader recover column names without relying on
+                    # h5py attribute order, which is alphabetical rather than insertion order.
+                    metadata_df = pd.DataFrame({col: [val] for col, val in metadata.items()})
+                    write_dataframe(h5file, group+'/metadata', metadata_df, columns=metadata_df.columns)
                     write_h5(h5file, group, 'image', image)
                     write_dataframe(h5file, group+'/fixations', fixations, columns=fixations.columns)
                 else:

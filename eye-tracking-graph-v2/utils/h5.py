@@ -32,6 +32,17 @@ def _stringify_object_array(values):
     return np.array([str(v) for v in values.ravel()], dtype=object).reshape(values.shape)
 
 
+# h5py's high-level API always treats "/" in a name as a path separator, so a leaf
+# dataset/group name containing a literal "/" (e.g. REFLACX's metadata column
+# "High lung volume / emphysema") silently splits into a nested group instead of being
+# stored as one item. Substitute a visually similar character to keep leaf names intact.
+_SLASH_SUBSTITUTE = "∕"  # DIVISION SLASH
+
+
+def _sanitize_leaf_name(name):
+    return name.replace("/", _SLASH_SUBSTITUTE) if isinstance(name, str) else name
+
+
 def get_or_create_group(h5file, group):
     """Navigate to (creating as needed) the group at `group`, returning the `h5py.Group`.
 
@@ -72,6 +83,7 @@ def write_h5(file, group, name, data, mode="a", attrs=None, **dataset_kwargs):
         data = _stringify_object_array(data)
         kwargs.setdefault("dtype", h5py.string_dtype(encoding="utf-8"))
 
+    name = _sanitize_leaf_name(name)
     with open_h5(file, mode) as f:
         target = get_or_create_group(f, group)
         if name in target:
@@ -106,9 +118,10 @@ def write_dataframe(file, group, df, mode="a", columns=None, column_attrs=None, 
                 values = _stringify_object_array(values)
                 kwargs.setdefault("dtype", h5py.string_dtype(encoding="utf-8"))
 
-            if col in target:
-                del target[col]
-            dset = target.create_dataset(col, data=values, **kwargs)
+            name = _sanitize_leaf_name(col)
+            if name in target:
+                del target[name]
+            dset = target.create_dataset(name, data=values, **kwargs)
             for key, value in column_attrs.get(col, {}).items():
                 dset.attrs[key] = value
         return target.name
