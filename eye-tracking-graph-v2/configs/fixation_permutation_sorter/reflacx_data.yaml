@@ -16,10 +16,10 @@ paths:
     - metadata_phase_1.csv
     - metadata_phase_2.csv
     - metadata_phase_3.csv
-  fixations_root: /home/extra/eye-tracking/reflacx/main_data
-  metadata_root: /home/extra/eye-tracking/reflacx/main_data
-  image_root: /home/extra/eye-tracking/mimic-cxr-jpg/files
-  h5_path: reflacx_data.h5
+  fixations_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
+  metadata_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
+  image_root: erda2/eye-tracking/mimic-cxr-jpg/files
+  h5_path: erda2/eye-tracking/normalized_data_softGT.h5
 
 dataset_name: reflacx
 removed_metadata_columns: [id, split, eye_tracking_data_discarded, image, dicom_id, subject_id]

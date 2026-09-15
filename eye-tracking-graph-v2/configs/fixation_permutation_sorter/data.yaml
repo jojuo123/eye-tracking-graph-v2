@@ -15,7 +15,7 @@
 data:
   train_dataset:
     type: permuted_h5
-    h5_path: reflacx_data.h5
+    h5_path: erda2/eye-tracking/normalized_data_softGT.h5
     split: TRAIN
     dataset_name: reflacx
     fixation_columns: [x_position_norm, y_position_norm]
