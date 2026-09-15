@@ -11,5 +11,6 @@ def build_model(cfg):
 # Import model modules so their @MODELS.register(...) decorators run.
 from models import example_model  # noqa: E402,F401
 from models import sinkhorn_sort_model  # noqa: E402,F401
+from models import fixation_permutation_sorter  # noqa: E402,F401
 
 __all__ = ["MODELS", "build_model"]

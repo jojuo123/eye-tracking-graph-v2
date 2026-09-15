@@ -15,8 +15,10 @@ def build_trainer(full_cfg):
 
 from trainers.base_trainer import BaseTrainer  # noqa: E402
 from trainers.example_trainer import ExampleTrainer  # noqa: E402
+from trainers.permutation_trainer import PermutationTrainer  # noqa: E402
 
 TRAINERS.register("base_trainer")(BaseTrainer)
 TRAINERS.register("example_trainer")(ExampleTrainer)
+TRAINERS.register("permutation_trainer")(PermutationTrainer)
 
-__all__ = ["TRAINERS", "build_trainer", "BaseTrainer", "ExampleTrainer"]
+__all__ = ["TRAINERS", "build_trainer", "BaseTrainer", "ExampleTrainer", "PermutationTrainer"]

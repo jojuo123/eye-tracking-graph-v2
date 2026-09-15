@@ -1,0 +1,23 @@
+# Run/optimizer/scheduler hyperparameters for training `fixation_permutation_sorter`.
+
+work_dir: ./work_dir/fixation_permutation_sorter
+seed: 42
+device: cuda   # falls back to cpu automatically if CUDA is unavailable
+monitor_metric: permutation_accuracy
+monitor_mode: max
+max_checkpoints: 5
+
+optimizer:
+  type: adamw
+  lr: 0.0003
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  T_max: 50
+
+trainer:
+  type: permutation_trainer   # wires each dataset's own collate_fn into its DataLoader
+  num_epochs: 50
+  log_interval: 20
+  grad_clip_norm: 1.0         # Sinkhorn's log-space iterations can produce large gradients

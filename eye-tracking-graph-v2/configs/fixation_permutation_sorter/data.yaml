@@ -1,0 +1,47 @@
+# Dataset/dataloader section for training `fixation_permutation_sorter`
+# (models/fixation_permutation_sorter.py) on REFLACX.
+#
+# `fixation_columns`/`coordinate_columns`/`coordinate_bounds`/`out_of_bounds` here must match
+# `reflacx_data.yaml` (in this same folder) -- that file drives what preprocessing wrote to
+# the H5 file (including the `soft_permutation` matrix), and `SingleH5Dataset`/
+# `PermutedFixationH5Dataset` re-derive out-of-bounds handling dynamically from whatever is
+# passed here. If you change one, change the other and re-run preprocessing.
+#
+# `fixation_columns` is pinned to exactly the two coordinate columns (rather than the
+# `null`/"every column" default) so `model.yaml`'s `coordinate_indices: [0, 1]` is
+# unambiguous, and so `permutation_reconstruction`/`fixation_sequence_mse` operate purely
+# over (x, y).
+
+data:
+  train_dataset:
+    type: permuted_h5
+    h5_path: reflacx_data.h5
+    split: TRAIN
+    dataset_name: reflacx
+    fixation_columns: [x_position_norm, y_position_norm]
+    coordinate_columns: [x_position_norm, y_position_norm]
+    coordinate_bounds: [0.0, 1.0]
+    out_of_bounds: ignore
+    load_soft_permutation: true
+    deterministic: false   # fresh random shuffle every access -- training augmentation
+  train_loader:
+    batch_size: 16
+    shuffle: true
+    num_workers: 4
+
+  val_dataset:
+    type: permuted_h5
+    h5_path: reflacx_data.h5
+    split: VAL
+    dataset_name: reflacx
+    fixation_columns: [x_position_norm, y_position_norm]
+    coordinate_columns: [x_position_norm, y_position_norm]
+    coordinate_bounds: [0.0, 1.0]
+    out_of_bounds: ignore
+    load_soft_permutation: true
+    deterministic: true    # fixed per-sample shuffle -- comparable metrics across epochs
+    seed: 0
+  val_loader:
+    batch_size: 32
+    shuffle: false
+    num_workers: 2

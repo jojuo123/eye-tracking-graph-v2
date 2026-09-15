@@ -1,5 +1,7 @@
 """Lightweight YAML config loading with attribute-style access."""
 
+import os
+
 import yaml
 
 
@@ -34,6 +36,27 @@ class Config(dict):
 
 
 def load_config(path: str) -> Config:
+    """Loads a YAML config, merging in any files listed under a top-level `includes:` key
+    first -- so a big config can be assembled from several smaller, independently-readable
+    ones (e.g. one experiment folder's `data.yaml`, `model.yaml`, `trainer.yaml`, ...)
+    instead of duplicating their content.
+
+    `includes` is a list of paths, resolved relative to `path`'s own directory (or
+    absolute), loaded and shallow-merged in order -- later includes override earlier ones,
+    and the including file's own top-level keys override every include. Nested (an included
+    file can itself have `includes`) and existing configs are unaffected, since none of them
+    have this key.
+    """
     with open(path, "r") as f:
-        raw = yaml.safe_load(f)
-    return Config(raw or {})
+        raw = yaml.safe_load(f) or {}
+
+    includes = raw.pop("includes", None)
+    merged = {}
+    if includes:
+        base_dir = os.path.dirname(path)
+        for include_path in includes:
+            if not os.path.isabs(include_path):
+                include_path = os.path.join(base_dir, include_path)
+            merged.update(load_config(include_path))
+    merged.update(raw)
+    return Config(merged)

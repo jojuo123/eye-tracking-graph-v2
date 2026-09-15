@@ -1,0 +1,36 @@
+# Architecture for `models.fixation_permutation_sorter.FixationPermutationSorter`.
+# `loss_cfg`/`metrics_cfg` live in their own files (losses.yaml/metrics.yaml) in this same
+# folder -- PermutationTrainer merges them in (see trainers/permutation_trainer.py) -- so
+# this file stays purely about the model's architecture.
+
+model:
+  type: fixation_permutation_sorter
+
+  # Must match data.yaml's `coordinate_columns` order: index 0/1 of `fixations`' last
+  # dimension, given `fixation_columns: [x_position_norm, y_position_norm]` there.
+  coordinate_indices: [0, 1]
+  embed_dim: 128
+
+  encoder_cfg:
+    in_channels: 1              # grayscale chest X-rays
+    resnet_base_channels: 32
+    resnet_layers: [2, 2, 2, 2]
+    selected_levels: [1, 2, 3]  # stage 0, 1, 2 outputs of the ResNet pyramid
+    coord_encoding_cfg:
+      type: fourier
+      num_frequencies: 64
+      sigma: 10.0
+    fusion_mode: cross_attention
+    residual_cross_attention: true
+    n_heads: 4
+    dropout: 0.1
+
+  context_n_layers: 2           # self-attention layers mixing context across fixations
+  context_n_heads: 4
+  context_dropout: 0.1
+
+  sinkhorn_cfg:
+    tau: 0.5
+    n_iters: 20
+    noise_factor: 1.0
+    n_samples: 1

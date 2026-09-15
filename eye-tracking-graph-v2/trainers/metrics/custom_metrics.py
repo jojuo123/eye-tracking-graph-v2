@@ -94,22 +94,42 @@ class IoUScore:
 class PermutationAccuracy:
     """Fraction of sequence elements assigned to their correct position by a
     hard permutation prediction (e.g. `modules.sinkhorn.hungarian_matching`'s
-    output). `outputs`/`targets`: `(B, N)` integer position indices."""
+    output). `outputs`/`targets`: `(B, N)` integer position indices.
+
+    Pass `mask` (`(B, N)` bool, True at valid/non-padded positions, e.g. a batch's
+    `fixations_mask`) to exclude padded positions from the average -- without it, a
+    padded batch's accuracy would be distorted (e.g. inflated, since
+    `modules.sinkhorn.apply_padding_mask` forces padded rows to a trivial self-match)
+    by however many padded positions it has, which says nothing about the actual
+    prediction.
+    """
 
     @torch.no_grad()
-    def __call__(self, outputs, targets):
-        return (outputs == targets).float().mean()
+    def __call__(self, outputs, targets, mask=None):
+        correct = (outputs == targets).float()
+        if mask is None:
+            return correct.mean()
+        mask = mask.to(correct.dtype)
+        return (correct * mask).sum() / mask.sum().clamp_min(1e-8)
 
 
 @METRICS.register("exact_match")
 class ExactMatch:
-    """Fraction of samples whose entire predicted permutation matches the
-    target exactly (every position correct). `outputs`/`targets`: `(B, N)`
-    integer position indices."""
+    """Fraction of samples whose entire *valid* predicted permutation matches the target
+    exactly (every non-padded position correct). `outputs`/`targets`: `(B, N)` integer
+    position indices.
+
+    Pass `mask` (`(B, N)` bool, True at valid/non-padded positions) so a sample's padded
+    tail (whose predicted/target values are otherwise arbitrary) can't spuriously flip its
+    exact-match result either way.
+    """
 
     @torch.no_grad()
-    def __call__(self, outputs, targets):
-        return (outputs == targets).all(dim=-1).float().mean()
+    def __call__(self, outputs, targets, mask=None):
+        correct = outputs == targets
+        if mask is not None:
+            correct = correct | ~mask  # padded positions are ignored, not required to match
+        return correct.all(dim=-1).float().mean()
 
 
 @METRICS.register("psnr")

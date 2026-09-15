@@ -52,18 +52,30 @@ class TransformerEncoderBlock(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    """A stack of pre-norm `TransformerEncoderBlock`s with sinusoidal positional encoding."""
+    """A stack of pre-norm `TransformerEncoderBlock`s with sinusoidal positional encoding.
 
-    def __init__(self, d_model, n_heads, n_layers, d_ff=None, dropout=0.1, max_len=5000):
+    Set `use_positional_encoding=False` for inputs whose *order* carries no meaning of its
+    own -- e.g. a set of per-fixation embeddings in a permutation-learning task, where the
+    sequence order is exactly the shuffled arrangement a downstream head has to recover.
+    `PositionalEncoding` is keyed by index, so leaving it on would hand the model a direct
+    readout of that shuffled order, contaminating the very thing it's supposed to predict.
+    With it off, self-attention remains permutation-equivariant: permuting the input
+    permutes the output identically, since nothing here depends on position, only content
+    and (via `key_padding_mask`) which tokens are valid.
+    """
+
+    def __init__(self, d_model, n_heads, n_layers, d_ff=None, dropout=0.1, max_len=5000, use_positional_encoding=True):
         super().__init__()
-        self.pos_enc = PositionalEncoding(d_model, max_len, dropout)
+        self.use_positional_encoding = use_positional_encoding
+        self.pos_enc = PositionalEncoding(d_model, max_len, dropout) if use_positional_encoding else None
         self.layers = nn.ModuleList(
             [TransformerEncoderBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
         )
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x, attn_mask=None, key_padding_mask=None):
-        x = self.pos_enc(x)
+        if self.pos_enc is not None:
+            x = self.pos_enc(x)
         for layer in self.layers:
             x = layer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
         return self.norm(x)

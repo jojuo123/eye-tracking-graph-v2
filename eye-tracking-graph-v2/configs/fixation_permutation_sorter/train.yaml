@@ -1,0 +1,20 @@
+# Entry point for training the REFLACX fixation-permutation model:
+#   python main.py --config configs/fixation_permutation_sorter/train.yaml
+#
+# Assembled from the other files in this folder via `utils.config.load_config`'s
+# `includes:` (each stays independently readable/editable -- see their own headers):
+#   reflacx_data.yaml -- preprocessing + the out-of-bounds/soft-ground-truth settings that
+#                        data.yaml's dataset sections must match (not itself included here;
+#                        it configures `data/reflacx/reflacx.py::preprocess`, run separately
+#                        to produce data.yaml's `h5_path`)
+#   data.yaml         -- dataset/dataloader config
+#   model.yaml        -- model architecture
+#   losses.yaml       -- which loss(es) to combine, and their weights
+#   metrics.yaml      -- which validation/test metrics to compute
+#   trainer.yaml      -- run/optimizer/scheduler hyperparameters
+includes:
+  - data.yaml
+  - model.yaml
+  - losses.yaml
+  - metrics.yaml
+  - trainer.yaml

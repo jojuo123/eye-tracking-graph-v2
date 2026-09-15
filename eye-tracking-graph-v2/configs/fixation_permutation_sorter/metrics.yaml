@@ -1,0 +1,15 @@
+# Metrics for `fixation_permutation_sorter` -- merged into `model.metrics_cfg` by
+# `PermutationTrainer`, computed at both train and validation time (see
+# trainers/evaluator.py, which just aggregates whatever the model returns under
+# output["metrics"]) whenever a batch has permutation targets.
+#
+# permutation_accuracy    -- fraction of fixations assigned to their correct position by the
+#                             model's hard (Hungarian) prediction (trainers/metrics/
+#                             custom_metrics.py)
+# fixation_sequence_mse   -- average pairwise MSE between the sequence reconstructed via that
+#                             hard prediction and the true, unshuffled sequence
+#                             (trainers/metrics/scanpath_metrics.py)
+
+metrics_cfg:
+  - permutation_accuracy
+  - fixation_sequence_mse

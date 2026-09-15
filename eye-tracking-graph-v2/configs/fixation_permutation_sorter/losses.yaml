@@ -1,0 +1,28 @@
+# Loss for `fixation_permutation_sorter` -- merged into `model.loss_cfg` by
+# `PermutationTrainer` (see trainers/permutation_trainer.py). Each entry's `type` must be
+# one of the four permutation-learning losses in trainers/losses/permutation_losses.py:
+#   permutation                      -- row-wise NLL against the target column (the
+#                                        "textbook" Gumbel-Sinkhorn loss)
+#   doubly_stochastic_cross_entropy  -- cross-entropy against a full target matrix; uses the
+#                                        dataset's soft `soft_permutation` ground truth when
+#                                        present (data.yaml sets load_soft_permutation: true)
+#                                        instead of the hard one-hot permutation matrix
+#   permutation_reconstruction       -- MSE between the reconstructed sequence and the true
+#                                        (unshuffled) one
+#   permutation_wasserstein          -- smoother, distance-aware alternative to `permutation`
+#                                        that gives partial credit for near-miss assignments
+#
+# This is a genuine combination of several (rather than picking just one), each weighted
+# independently -- comment any of these out (or set weight: 0) to fall back to a subset.
+
+loss_cfg:
+  - type: permutation
+    weight: 1.0
+  - type: doubly_stochastic_cross_entropy
+    weight: 0.5
+  - type: permutation_reconstruction
+    weight: 1.0
+    reduction: mse
+  - type: permutation_wasserstein
+    weight: 0.1
+    ground_metric: squared
