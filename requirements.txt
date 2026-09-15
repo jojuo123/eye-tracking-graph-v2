@@ -1,6 +1,6 @@
 torch>=2.0
 pyyaml>=6.0
-numpy>=1.23
+numpy~=1.26
 scipy>=1.9   # modules/sinkhorn.py: hungarian_matching (linear_sum_assignment)
 h5py>=3.8    # utils/h5.py: HDF5 dataset writing
 pandas>=1.5  # utils/h5.py: write_dataframe

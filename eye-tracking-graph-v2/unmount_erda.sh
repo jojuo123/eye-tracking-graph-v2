@@ -7,8 +7,11 @@ echo "Unmounting ERDA if mounted..."
 
 # Try clean unmount
 if mountpoint -q "$mnt"; then
+  chmod +rx $HOME
   fusermount -uz "$mnt" || umount -l "$mnt" || true
   sleep 2
+  chmod -rx $HOME
+  chmod u+rx $HOME
 fi
 
 # Double-check: only remove if not mounted

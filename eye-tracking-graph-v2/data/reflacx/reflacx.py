@@ -11,14 +11,15 @@ from utils.h5 import *
 
 METADATA = [f"metadata_phase_{i}.csv" for i in range(1, 4)]
 REMOVED_COLUMNS = ['id', 'split', 'eye_tracking_data_discarded', 'image', 'dicom_id', 'subject_id']
-SPLIT_MAP = lambda x: 'TRAIN' if x == 'train' else ('VAL' if x == 'val' else 'TEST')
-# FIXATIONS_ROOT = 'erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data'
-# METADATA_ROOT = 'erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data'
-# IMAGE_ROOT = 'erda2/eye-tracking/mimic-cxr-jpg/files'
+SPLIT_MAP = lambda x: 'TRAIN' if x == 'train' else ('VAL' if x == 'validate' else 'TEST')
+FIXATIONS_ROOT = 'erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data'
+METADATA_ROOT = 'erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data'
+IMAGE_ROOT = 'erda2/eye-tracking/mimic-cxr-jpg/files'
 
-FIXATIONS_ROOT = '/home/extra/eye-tracking/reflacx/main_data'
-METADATA_ROOT = '/home/extra/eye-tracking/reflacx/main_data'
-IMAGE_ROOT = '/home/extra/eye-tracking/mimic-cxr-jpg/files'
+# FIXATIONS_ROOT = '/home/extra/eye-tracking/reflacx/main_data'
+# METADATA_ROOT = '/home/extra/eye-tracking/reflacx/main_data'
+# IMAGE_ROOT = '/home/extra/eye-tracking/mimic-cxr-jpg/files'
+H5_FILE = 'erda2/eye-tracking/normalized_data.h5'
 
 RESIZE = (224, 224)
 NORMALIZE = True
@@ -106,9 +107,10 @@ def preprocess(metadata_paths=METADATA, resize=RESIZE, normalize=NORMALIZE, to_h
     return dfs, count_stat
 
 if __name__ == "__main__":
-    reflacx_data = preprocess(n_first=10, to_h5=True, h5_path="reflacx_data.h5") #test
+    reflacx_data = preprocess(n_first=None, to_h5=True, h5_path=H5_FILE) #test
     print(reflacx_data[1])
     
-    with open_h5("reflacx_data.h5", mode='r') as h5file:
-        print(h5_tree(h5file))
+    # with open_h5("reflacx_data.h5", mode='r') as h5file:
+    #     print(h5_tree(h5file))
+    
     
