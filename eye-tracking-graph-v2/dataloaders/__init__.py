@@ -28,5 +28,6 @@ def build_dataloader(loader_cfg, dataset_cfg=None, dataset=None, **loader_kwargs
 # Import dataset modules so their @DATASETS.register(...) decorators run.
 from dataloaders import example_dataset  # noqa: E402,F401
 from dataloaders import patch_sequence_dataset  # noqa: E402,F401
+from dataloaders import reflacx_h5_dataset  # noqa: E402,F401
 
 __all__ = ["DATASETS", "build_dataset", "build_dataloader"]
