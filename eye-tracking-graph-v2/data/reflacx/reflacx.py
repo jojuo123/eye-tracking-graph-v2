@@ -61,6 +61,37 @@ def _expand_bounds(bounds):
     x_bounds, y_bounds = bounds
     return tuple(x_bounds), tuple(y_bounds)
 
+
+def apply_out_of_bounds(fixations, out_of_bounds, coordinate_columns, coordinate_bounds):
+    """Applies out-of-bounds handling to a sample's raw fixations DataFrame *once*, at
+    preprocessing time -- `preprocess` calls this before writing `fixations` to H5 and
+    before computing `compute_soft_ground_truth`, so both see the same already-handled
+    data and a dataloader reading the result never needs to redo this itself (pass
+    `out_of_bounds="ignore"`, the default `dataset_kwargs` uses, to `SingleH5Dataset`).
+
+    - `"ignore"`: returns `fixations` unchanged.
+    - `"clip"`: clamps `coordinate_columns` to `coordinate_bounds` (on a copy).
+    - `"remove"`: drops rows whose `coordinate_columns` fall outside `coordinate_bounds`.
+    """
+    if out_of_bounds == 'ignore':
+        return fixations
+
+    x_col, y_col = coordinate_columns
+    (x_min, x_max), (y_min, y_max) = _expand_bounds(coordinate_bounds)
+
+    if out_of_bounds == 'clip':
+        fixations = fixations.copy()
+        fixations[x_col] = fixations[x_col].clip(x_min, x_max)
+        fixations[y_col] = fixations[y_col].clip(y_min, y_max)
+        return fixations
+
+    if out_of_bounds == 'remove':
+        x, y = fixations[x_col].to_numpy(), fixations[y_col].to_numpy()
+        in_bounds = (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
+        return fixations.loc[in_bounds].reset_index(drop=True)
+
+    raise ValueError(f"out_of_bounds must be 'ignore', 'clip', or 'remove', got {out_of_bounds!r}")
+
 def refine_metadata_fields(df):
     def get_image_path(row):
         p = row.split('/')
@@ -103,9 +134,6 @@ def compute_soft_ground_truth(
     method=SOFT_GROUND_TRUTH_METHOD,
     tau=SOFT_GROUND_TRUTH_TAU,
     n_iters=SOFT_GROUND_TRUTH_N_ITERS,
-    out_of_bounds=OUT_OF_BOUNDS,
-    coordinate_columns=COORDINATE_COLUMNS,
-    coordinate_bounds=COORDINATE_BOUNDS,
 ):
     """Builds a soft "ground truth" doubly-stochastic `(n, n)` matrix for one sample's
     fixation sequence, in its original (canonical) order, for use as a target in
@@ -121,10 +149,19 @@ def compute_soft_ground_truth(
     prediction that spreads probability across genuinely similar fixations is barely
     penalized.
 
+    `fixations` should already have had `apply_out_of_bounds` applied (as `preprocess` does)
+    if out-of-bounds handling matters for this sample -- computing distances is a purely
+    pairwise operation, but Sinkhorn normalization is not (each row's normalization depends
+    on the sum over every column), so an out-of-bounds fixation still in the input would
+    distort every other row's normalization, not just its own. There is no way to correctly
+    "remove" a fixation's influence from this function's *output* after the fact; it has to
+    be excluded from the *input*.
+
     Args:
-        fixations: a sample's `fixations.csv` DataFrame (as returned by `load_fixations`),
-            in its original order -- this is computed before any shuffling, which happens
-            later at dataset-loading time (`dataloaders.permuted_h5_dataset`).
+        fixations: a sample's `fixations.csv` DataFrame (as returned by `load_fixations`,
+            typically after `apply_out_of_bounds`), in its original order -- this is
+            computed before any shuffling, which happens later at dataset-loading time
+            (`dataloaders.permuted_h5_dataset`).
         columns: which columns to compare fixations on. Defaults to the normalized position
             columns `load_fixations` adds, so distances are comparable across samples with
             different image sizes; requires `normalize=True` when those were loaded.
@@ -139,35 +176,10 @@ def compute_soft_ground_truth(
             provided mainly for comparison/debugging, not because it's expected to differ
             from a plain hard target in practice.
         tau, n_iters: forwarded to `sinkhorn_norm` (ignored for `"linear_sum_assignment"`).
-        out_of_bounds, coordinate_columns, coordinate_bounds: mirror
-            `dataloaders.single_h5_dataset.SingleH5Dataset`'s constructor args of the same
-            name (default: `configs/reflacx_data.yaml`'s `fixations.*`, so both sides agree
-            unless explicitly told otherwise) -- distances must be computed on whatever
-            coordinates the dataloader will actually return, or this matrix would silently
-            disagree with what a model sees:
-              - `"ignore"`/`"remove"`: no value transform is needed here. `"remove"`'s
-                dropped fixations are excluded post-hoc from the loaded matrix by
-                `SingleH5Dataset.__getitem__` itself -- subsetting rows/cols of a
-                pairwise-distance matrix computed over a superset gives exactly the same
-                submatrix as computing it over just the subset -- so the *stored* matrix
-                must stay full-size, matching the untouched `fixations` group.
-              - `"clip"`: the dataloader permanently clamps coordinates before a model ever
-                sees them, so distances must be computed on the same clamped values here,
-                not the raw ones -- otherwise an out-of-bounds fixation's distance to its
-                neighbors would be systematically wrong relative to what's actually observed.
     """
     missing = [col for col in columns if col not in fixations.columns]
     if missing:
         raise ValueError(f"compute_soft_ground_truth: columns {missing} not found in fixations (normalize=False?)")
-
-    if out_of_bounds == 'clip':
-        fixations = fixations.copy()
-        x_col, y_col = coordinate_columns
-        (x_min, x_max), (y_min, y_max) = _expand_bounds(coordinate_bounds)
-        fixations[x_col] = fixations[x_col].clip(x_min, x_max)
-        fixations[y_col] = fixations[y_col].clip(y_min, y_max)
-    elif out_of_bounds not in ('ignore', 'remove'):
-        raise ValueError(f"out_of_bounds must be 'ignore', 'clip', or 'remove', got {out_of_bounds!r}")
 
     values = fixations[list(columns)].to_numpy(dtype=np.float64)
     n = len(values)
@@ -193,11 +205,17 @@ def dataset_kwargs(split, config=REFLACX_CONFIG, **overrides):
 
         SingleH5Dataset(**reflacx.dataset_kwargs("TRAIN"))
 
-    `overrides` replaces any field, e.g. `dataset_kwargs("TRAIN", load_soft_permutation=True)`
-    -- but overriding `out_of_bounds`/`coordinate_columns`/`coordinate_bounds` this way
-    re-introduces exactly the preprocessing/dataloader mismatch this shared config exists to
-    prevent, unless `compute_soft_ground_truth`/`preprocess` was also run with the same
-    override.
+    `out_of_bounds` is hardcoded to `"ignore"` here, deliberately *not* read from
+    `config.fixations.out_of_bounds`: `preprocess` (via `apply_out_of_bounds`) already
+    clips/removes out-of-bounds fixations once, before writing `fixations` (and computing
+    `soft_permutation`) to the H5 file, so by the time a dataset reads it back, there is
+    nothing left to clip or remove -- `config.fixations.out_of_bounds` describes what
+    preprocessing did, not what the dataloader needs to do again. `coordinate_columns`/
+    `coordinate_bounds` are still passed through (harmlessly inert while `out_of_bounds`
+    stays `"ignore"`) so overriding `out_of_bounds` back to `"clip"`/`"remove"` -- e.g. to
+    read an H5 file that predates this preprocessing step -- has everything it needs.
+
+    `overrides` replaces any field, e.g. `dataset_kwargs("TRAIN", load_soft_permutation=True)`.
     """
     kwargs = dict(
         h5_path=config.paths.h5_path,
@@ -208,7 +226,7 @@ def dataset_kwargs(split, config=REFLACX_CONFIG, **overrides):
         normalize_image=config.image.normalize_image,
         coordinate_columns=tuple(config.fixations.coordinate_columns),
         coordinate_bounds=tuple(config.fixations.coordinate_bounds),
-        out_of_bounds=config.fixations.out_of_bounds,
+        out_of_bounds="ignore",
         load_soft_permutation=config.load_soft_permutation,
     )
     kwargs.update(overrides)
@@ -261,6 +279,12 @@ def preprocess(
                 phase = path.split('_')[-1].split('.')[0]
                 metadata['phase'] = phase # add phase to metadata
 
+                # Applied once, here -- before writing `fixations` and before computing
+                # `soft_permutation` -- so both agree, and a dataloader reading the result
+                # back never needs to clip/remove anything itself (see `dataset_kwargs`,
+                # which hardcodes `out_of_bounds="ignore"` for exactly this reason).
+                fixations = apply_out_of_bounds(fixations, out_of_bounds, coordinate_columns, coordinate_bounds)
+
                 if to_h5:
                     metadata['N_fixations'] = len(fixations.index)
                     # Build a single-row DataFrame (rather than metadata.to_numpy()) so each
@@ -279,9 +303,6 @@ def preprocess(
                             method=soft_ground_truth_method,
                             tau=soft_ground_truth_tau,
                             n_iters=soft_ground_truth_n_iters,
-                            out_of_bounds=out_of_bounds,
-                            coordinate_columns=coordinate_columns,
-                            coordinate_bounds=coordinate_bounds,
                         )
                         write_h5(h5file, group, 'soft_permutation', soft_gt)
                 else:

@@ -1,11 +1,13 @@
 # Dataset/dataloader section for training `fixation_permutation_sorter`
 # (models/fixation_permutation_sorter.py) on REFLACX.
 #
-# `fixation_columns`/`coordinate_columns`/`coordinate_bounds`/`out_of_bounds` here must match
-# `reflacx_data.yaml` (in this same folder) -- that file drives what preprocessing wrote to
-# the H5 file (including the `soft_permutation` matrix), and `SingleH5Dataset`/
-# `PermutedFixationH5Dataset` re-derive out-of-bounds handling dynamically from whatever is
-# passed here. If you change one, change the other and re-run preprocessing.
+# `fixation_columns`/`coordinate_columns`/`coordinate_bounds` here must match
+# `reflacx_data.yaml` (in this same folder), which drives what preprocessing actually wrote
+# to the H5 file (including `soft_permutation`). `out_of_bounds: ignore` here is
+# deliberate, not a placeholder: preprocessing (`apply_out_of_bounds`) already clips/removes
+# out-of-bounds fixations once before writing the H5 file, so there's nothing left for
+# `SingleH5Dataset`/`PermutedFixationH5Dataset` to do at load time -- only change this away
+# from `ignore` if reading an H5 file that predates that preprocessing step.
 #
 # `fixation_columns` is pinned to exactly the two coordinate columns (rather than the
 # `null`/"every column" default) so `model.yaml`'s `coordinate_indices: [0, 1]` is

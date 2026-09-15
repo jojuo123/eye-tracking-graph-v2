@@ -1,15 +1,20 @@
 # Shared between `data/reflacx/reflacx.py` (preprocessing) and
-# `dataloaders/single_h5_dataset.py` (via `data.reflacx.reflacx.dataset_kwargs`), so both
-# sides always agree on where the data lives, what counts as an out-of-bounds fixation, and
-# how the soft ground-truth matrix is computed.
+# `dataloaders/single_h5_dataset.py` (via `data.reflacx.reflacx.dataset_kwargs`).
 #
-# This matters because `out_of_bounds`/`coordinate_columns`/`coordinate_bounds` here also
-# steer `compute_soft_ground_truth` at preprocessing time: "clip" mode's soft-permutation
-# distances must be computed on the same (clamped) coordinates the dataloader will actually
-# return, or the precomputed matrix would silently disagree with what a model sees. Change
-# `fixations.out_of_bounds` (or the bounds/columns) here and re-run preprocessing to keep
-# them in sync -- editing only the dataloader side (or vice versa) re-introduces the mismatch
-# this file exists to prevent.
+# `fixations.out_of_bounds`/`coordinate_columns`/`coordinate_bounds` describe what
+# *preprocessing* does: `preprocess` applies `apply_out_of_bounds` to each sample's raw
+# fixations once, before writing them to H5 and before computing `soft_permutation`
+# (`compute_soft_ground_truth`) -- so the stored `fixations` are already clipped/filtered,
+# and `soft_permutation` was computed on that same already-handled data (there's no correct
+# way to fix this up after the fact for "remove": Sinkhorn normalization is a whole-matrix
+# operation, so an out-of-bounds fixation left in at compute time distorts every other row's
+# normalization too, not just its own -- see `compute_soft_ground_truth`'s docstring).
+# Because of this, `dataset_kwargs` hardcodes the *dataloader's* `out_of_bounds` to
+# `"ignore"` regardless of the value here -- by the time a dataset reads the H5 file back,
+# there's nothing left to clip or remove. Change this file's `fixations.*` and re-run
+# preprocessing to change the actual behavior; changing a dataloader's `out_of_bounds`
+# directly only matters when overriding `dataset_kwargs` to read an H5 file that predates
+# this preprocessing step.
 
 paths:
   metadata:
@@ -34,7 +39,7 @@ fixations:
   fixation_columns: null                       # null = every column present (SingleH5Dataset's default)
   coordinate_columns: [x_position_norm, y_position_norm]
   coordinate_bounds: [0.0, 1.0]                # [min, max] for both axes, or [[x_min,x_max],[y_min,y_max]]
-  out_of_bounds: ignore                        # ignore | clip | remove
+  out_of_bounds: remove                        # ignore | clip | remove
 
 soft_ground_truth:
   enabled: true
