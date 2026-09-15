@@ -30,6 +30,13 @@ from utils.checkpoint import CheckpointManager
 
 
 class PermutationTrainer(ExampleTrainer):
+    @staticmethod
+    def _build_loader(cfg, dataset_key, loader_key):
+        if dataset_key not in cfg["data"]:
+            return None
+        dataset = build_dataset(cfg["data"][dataset_key])
+        return build_dataloader(cfg["data"][loader_key], dataset=dataset, collate_fn=getattr(dataset, "collate_fn", None))
+
     def build(self):
         cfg = self.cfg
 
@@ -42,17 +49,9 @@ class PermutationTrainer(ExampleTrainer):
         self.model = build_model(model_cfg).to(self.device)
         self.logger.info(f"Built model '{model_cfg['type']}' with {self.model.num_parameters:,} trainable params")
 
-        train_dataset = build_dataset(cfg["data"]["train_dataset"])
-        self.train_loader = build_dataloader(
-            cfg["data"]["train_loader"], dataset=train_dataset, collate_fn=getattr(train_dataset, "collate_fn", None)
-        )
-
-        self.val_loader = None
-        if "val_dataset" in cfg["data"]:
-            val_dataset = build_dataset(cfg["data"]["val_dataset"])
-            self.val_loader = build_dataloader(
-                cfg["data"]["val_loader"], dataset=val_dataset, collate_fn=getattr(val_dataset, "collate_fn", None)
-            )
+        self.train_loader = self._build_loader(cfg, "train_dataset", "train_loader")
+        self.val_loader = self._build_loader(cfg, "val_dataset", "val_loader")
+        self.test_loader = self._build_loader(cfg, "test_dataset", "test_loader")
 
         self.optimizer = build_optimizer(cfg["optimizer"], self.model.parameters())
         self.scheduler = build_scheduler(cfg.get("scheduler"), self.optimizer)

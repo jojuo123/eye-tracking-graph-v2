@@ -40,6 +40,7 @@ class BaseTrainer:
         self.scheduler = None
         self.train_loader = None
         self.val_loader = None
+        self.test_loader = None
         self.evaluator = None
         self.inferrer = None
         self.ckpt_manager = None
@@ -63,6 +64,9 @@ class BaseTrainer:
         self.val_loader = None
         if "val_dataset" in cfg["data"]:
             self.val_loader = build_dataloader(cfg["data"]["val_loader"], dataset_cfg=cfg["data"]["val_dataset"])
+        self.test_loader = None
+        if "test_dataset" in cfg["data"]:
+            self.test_loader = build_dataloader(cfg["data"]["test_loader"], dataset_cfg=cfg["data"]["test_dataset"])
 
         self.optimizer = build_optimizer(cfg["optimizer"], self.model.parameters())
         self.scheduler = build_scheduler(cfg.get("scheduler"), self.optimizer)
@@ -170,11 +174,30 @@ class BaseTrainer:
             self.scheduler.load_state_dict(state["scheduler"])
 
     def resume(self, path=None):
-        """Resume from an explicit checkpoint path, or the latest one if not given."""
-        path = path or self.ckpt_manager.latest()
+        """Resume from an explicit checkpoint path, the special value `"best"` (the
+        tracked best checkpoint), or the latest one if `path` isn't given. Returns whether
+        a checkpoint was actually found and loaded."""
+        path = self.ckpt_manager.best() if path == "best" else (path or self.ckpt_manager.latest())
         if path is None:
             self.logger.info("No checkpoint found, starting from scratch.")
-            return
+            return False
         self.logger.info(f"Resuming from checkpoint: {path}")
         state = CheckpointManager.load(path, map_location=self.device)
         self.load_state_dict(state)
+        return True
+
+    # ------------------------------------------------------------------ #
+    # Testing
+    # ------------------------------------------------------------------ #
+    def test(self):
+        """Run one full evaluation pass over `self.test_loader` (built from
+        `cfg["data"]["test_dataset"]`, if present), logging and returning the averaged
+        {name: value} metrics -- same aggregation `_validate_and_checkpoint` uses for
+        validation, via the same generic `Evaluator`."""
+        assert self._built, "Call trainer.build() before trainer.test()"
+        if self.test_loader is None:
+            self.logger.info("No test_dataset configured; skipping test.")
+            return {}
+        test_metrics = Evaluator(self.model, self.test_loader, device=self.device).evaluate()
+        self.logger.info("test: " + " | ".join(f"{k}={v:.4f}" for k, v in test_metrics.items()))
+        return test_metrics

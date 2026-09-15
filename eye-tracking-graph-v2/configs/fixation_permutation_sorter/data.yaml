@@ -45,3 +45,20 @@ data:
     batch_size: 32
     shuffle: false
     num_workers: 2
+
+  test_dataset:
+    type: permuted_h5
+    h5_path: reflacx_data.h5
+    split: TEST
+    dataset_name: reflacx
+    fixation_columns: [x_position_norm, y_position_norm]
+    coordinate_columns: [x_position_norm, y_position_norm]
+    coordinate_bounds: [0.0, 1.0]
+    out_of_bounds: ignore
+    load_soft_permutation: true
+    deterministic: true    # fixed per-sample shuffle -- reproducible final test numbers
+    seed: 0
+  test_loader:
+    batch_size: 32
+    shuffle: false
+    num_workers: 2
