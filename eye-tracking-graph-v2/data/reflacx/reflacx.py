@@ -50,6 +50,7 @@ SOFT_GROUND_TRUTH_METHOD = REFLACX_CONFIG.soft_ground_truth.method
 SOFT_GROUND_TRUTH_COLUMNS = list(REFLACX_CONFIG.soft_ground_truth.columns)
 SOFT_GROUND_TRUTH_TAU = REFLACX_CONFIG.soft_ground_truth.tau
 SOFT_GROUND_TRUTH_N_ITERS = REFLACX_CONFIG.soft_ground_truth.n_iters
+SOFT_GROUND_TRUTH_SCALE = REFLACX_CONFIG.soft_ground_truth.get("scale", 1.0)
 
 
 def _expand_bounds(bounds):
@@ -134,6 +135,7 @@ def compute_soft_ground_truth(
     method=SOFT_GROUND_TRUTH_METHOD,
     tau=SOFT_GROUND_TRUTH_TAU,
     n_iters=SOFT_GROUND_TRUTH_N_ITERS,
+    scale=SOFT_GROUND_TRUTH_SCALE,
 ):
     """Builds a soft "ground truth" doubly-stochastic `(n, n)` matrix for one sample's
     fixation sequence, in its original (canonical) order, for use as a target in
@@ -144,10 +146,9 @@ def compute_soft_ground_truth(
     region) are, for the purposes of *recovering scanpath order*, nearly interchangeable --
     a hard 0/1 target penalizes a model exactly as much for confusing two such fixations as
     for a wildly wrong prediction, which mis-states the task. This instead scores every pair
-    of fixations `(i, j)` by their squared difference (mean over `columns`, i.e. an MSE) and
-    turns the resulting `(n, n)` distance matrix into a doubly-stochastic matrix, so a
-    prediction that spreads probability across genuinely similar fixations is barely
-    penalized.
+    of fixations `(i, j)` by their Euclidean distance (over `columns`) and turns the
+    resulting `(n, n)` distance matrix into a doubly-stochastic matrix, so a prediction that
+    spreads probability across genuinely similar fixations is barely penalized.
 
     `fixations` should already have had `apply_out_of_bounds` applied (as `preprocess` does)
     if out-of-bounds handling matters for this sample -- computing distances is a purely
@@ -176,6 +177,15 @@ def compute_soft_ground_truth(
             provided mainly for comparison/debugging, not because it's expected to differ
             from a plain hard target in practice.
         tau, n_iters: forwarded to `sinkhorn_norm` (ignored for `"linear_sum_assignment"`).
+        scale: multiplies the distance map before it's turned into a Sinkhorn compatibility
+            score (`-distance * scale / tau`), ignored for `"linear_sum_assignment"` (which
+            only cares about each row/column's arg-min, unaffected by a uniform rescaling).
+            `columns` defaults to `[0, 1]`-normalized coordinates, where pairwise Euclidean
+            distances are small (at most `sqrt(2)`) -- at `tau=1.0` that barely perturbs
+            Sinkhorn away from a uniform `1/n` matrix (see this module's `SOFT_GROUND_TRUTH_SCALE`
+            default and `visualize_soft_gt_scale.py`, which demonstrates the effect). Raise
+            `scale` to sharpen the normalized matrix toward a hard permutation without having
+            to also rescale `tau` or switch `columns` to pixel space.
     """
     missing = [col for col in columns if col not in fixations.columns]
     if missing:
@@ -183,10 +193,10 @@ def compute_soft_ground_truth(
 
     values = fixations[list(columns)].to_numpy(dtype=np.float64)
     n = len(values)
-    distance = np.mean((values[:, None, :] - values[None, :, :]) ** 2, axis=-1)  # (n, n) pairwise MSE
+    distance = np.sqrt(np.sum((values[:, None, :] - values[None, :, :]) ** 2, axis=-1))  # (n, n) pairwise Euclidean distance
 
     if method == 'sinkhorn':
-        log_alpha = torch.from_numpy(-distance / tau).float().unsqueeze(0)
+        log_alpha = torch.from_numpy(-distance * scale / tau).float().unsqueeze(0)
         soft_gt = sinkhorn_norm(log_alpha, n_iters=n_iters)[0].numpy()
     elif method == 'linear_sum_assignment':
         row_idx, col_idx = linear_sum_assignment(distance)
@@ -262,6 +272,7 @@ def preprocess(
     soft_ground_truth_columns=SOFT_GROUND_TRUTH_COLUMNS,
     soft_ground_truth_tau=SOFT_GROUND_TRUTH_TAU,
     soft_ground_truth_n_iters=SOFT_GROUND_TRUTH_N_ITERS,
+    soft_ground_truth_scale=SOFT_GROUND_TRUTH_SCALE,
     out_of_bounds=OUT_OF_BOUNDS,
     coordinate_columns=COORDINATE_COLUMNS,
     coordinate_bounds=COORDINATE_BOUNDS,
@@ -303,6 +314,7 @@ def preprocess(
                             method=soft_ground_truth_method,
                             tau=soft_ground_truth_tau,
                             n_iters=soft_ground_truth_n_iters,
+                            scale=soft_ground_truth_scale,
                         )
                         write_h5(h5file, group, 'soft_permutation', soft_gt)
                 else:
