@@ -19,6 +19,7 @@ which one is used rather than relying on the batch's contents alone.
 
     python run_loss_ablation.py
     python run_loss_ablation.py --h5-path /path/to/reflacx_data.h5 --num-epochs 5 --device cpu
+    python run_loss_ablation.py --run-dir work_dir/my_experiment
 """
 
 import argparse
@@ -65,10 +66,16 @@ def parse_args():
     parser.add_argument("--num-epochs", type=int, default=None, help="Override every experiment's trainer.num_epochs")
     parser.add_argument("--device", type=str, default=None, help="Override every experiment's device")
     parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=os.path.join("work_dir", "loss_ablation"),
+        help="Base directory under which each experiment's work_dir is created (default: work_dir/loss_ablation)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
-        default=os.path.join("work_dir", "loss_ablation_results.csv"),
-        help="CSV path the combined results are written to",
+        default=None,
+        help="CSV path the combined results are written to (default: <run-dir>/results.csv)",
     )
     return parser.parse_args()
 
@@ -78,7 +85,7 @@ def build_experiment_config(experiment, args):
     overrides just this experiment's `loss_cfg`/`work_dir`, plus any CLI overrides."""
     cfg = dict(load_config(os.path.join(CONFIG_DIR, "train.yaml")))
     cfg["loss_cfg"] = experiment["loss_cfg"]
-    cfg["work_dir"] = os.path.join("work_dir", "loss_ablation", experiment["name"])
+    cfg["work_dir"] = os.path.join(args.run_dir, experiment["name"])
 
     if args.h5_path:
         cfg["data"] = dict(cfg["data"])
@@ -121,9 +128,10 @@ def write_csv(rows, path):
 
 def main():
     args = parse_args()
+    output = args.output or os.path.join(args.run_dir, "results.csv")
     rows = [run_experiment(experiment, args) for experiment in EXPERIMENTS]
-    write_csv(rows, args.output)
-    print(f"\nWrote results for {len(rows)} experiments to {args.output}")
+    write_csv(rows, output)
+    print(f"\nWrote results for {len(rows)} experiments to {output}")
 
 
 if __name__ == "__main__":
