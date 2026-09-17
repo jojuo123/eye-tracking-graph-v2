@@ -121,12 +121,14 @@ def load_image(image_path, resize=None, channel_first=True):
         print(e)
         return np.zeros((1, resize[1], resize[0]), dtype=np.uint8) if channel_first else np.zeros((resize[1], resize[0], 1), dtype=np.uint8)
     
-def load_fixations(fixation_path, normalize=True, image_size=None):
+def load_fixations(fixation_path, normalize=True, image_size=None, scale=None):
     # image_size = (X, Y) = (width, height)
     fixations = pd.read_csv(fixation_path)
     if normalize and image_size is not None:
         fixations['x_position_norm'] = fixations['x_position'] / image_size[0]
         fixations['y_position_norm'] = fixations['y_position'] / image_size[1]
+    if scale is not None:
+        fixations[['x_position_norm', 'y_position_norm']] *= scale
     return fixations
 
 def compute_soft_ground_truth(
@@ -196,7 +198,7 @@ def compute_soft_ground_truth(
     distance = np.sqrt(np.sum((values[:, None, :] - values[None, :, :]) ** 2, axis=-1))  # (n, n) pairwise Euclidean distance
 
     if method == 'sinkhorn':
-        log_alpha = torch.from_numpy(-distance * scale / tau).float().unsqueeze(0)
+        log_alpha = torch.from_numpy(-distance / tau).float().unsqueeze(0)
         soft_gt = sinkhorn_norm(log_alpha, n_iters=n_iters)[0].numpy()
     elif method == 'linear_sum_assignment':
         row_idx, col_idx = linear_sum_assignment(distance)
@@ -243,7 +245,7 @@ def dataset_kwargs(split, config=REFLACX_CONFIG, **overrides):
     return kwargs
 
 
-def get_field(df, resize, normalize):
+def get_field(df, resize, normalize, scale):
     ret_dict = {}
     for index, row in df.iterrows():
         image_path = os.path.join(IMAGE_ROOT, row['image'])
@@ -256,7 +258,7 @@ def get_field(df, resize, normalize):
         metadata = row.drop(REMOVED_COLUMNS)
         image_size = (row['image_size_x'], row['image_size_y'])
         fixations_path = os.path.join(FIXATIONS_ROOT, id_, 'fixations.csv')
-        fixations = load_fixations(fixations_path, normalize, image_size)
+        fixations = load_fixations(fixations_path, normalize, image_size, scale)
         
         yield group, metadata, image, fixations, split
 
@@ -278,6 +280,11 @@ def preprocess(
     coordinate_bounds=COORDINATE_BOUNDS,
 ):
     # write_dataframe(h5_path, group, df, mode='a', columns=df.columns, column_attrs=None)
+    if soft_ground_truth_scale is not None:
+        if soft_ground_truth_scale <= 0:
+            raise ValueError(f"soft_ground_truth_scale must be > 0, got {soft_ground_truth_scale}")
+        else:
+            coordinate_bounds = tuple((np.array(coordinate_bounds) * soft_ground_truth_scale).tolist())
     dfs = []
     count = 0
     count_stat = {(split.upper(), str(phase)): 0 for split in ['train', 'val', 'test'] for phase in range(1, 4)}
@@ -286,7 +293,7 @@ def preprocess(
             df = pd.read_csv(os.path.join(METADATA_ROOT, path))
             df = refine_metadata_fields(df)
 
-            for group, metadata, image, fixations, split in get_field(df, resize, normalize):
+            for group, metadata, image, fixations, split in get_field(df, resize, normalize, scale=soft_ground_truth_scale):
                 phase = path.split('_')[-1].split('.')[0]
                 metadata['phase'] = phase # add phase to metadata
 

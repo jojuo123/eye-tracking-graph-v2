@@ -24,7 +24,7 @@ paths:
   fixations_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
   metadata_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
   image_root: erda2/eye-tracking/mimic-cxr-jpg/files
-  h5_path: erda2/eye-tracking/normalized_data_softGT.h5
+  h5_path: erda2/eye-tracking/normalized_data_softGT_scaled.h5
 
 dataset_name: reflacx
 removed_metadata_columns: [id, split, eye_tracking_data_discarded, image, dicom_id, subject_id]

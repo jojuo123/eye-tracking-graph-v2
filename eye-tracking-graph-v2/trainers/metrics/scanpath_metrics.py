@@ -27,11 +27,19 @@ class FixationSequenceMSE:
 
     @torch.no_grad()
     def __call__(self, outputs, targets, mask=None):
-        error = (outputs - targets).pow(2).mean(dim=-1)  # (B, N)
+        # error = (outputs - targets).pow(2).mean(dim=-1)  # (B, N)
+        # if mask is None:
+        #     return error.mean()
+        # mask = mask.to(error.dtype)
+        # return (error * mask).sum() / mask.sum().clamp_min(1e-8)
+        error = (outputs - targets).pow(2).sum(dim=-1)  # (B, N)
+        error = torch.sqrt(error)  # (B, N)
         if mask is None:
             return error.mean()
         mask = mask.to(error.dtype)
-        return (error * mask).sum() / mask.sum().clamp_min(1e-8)
+        error = (error * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1e-8)  # (B,)
+        return error.mean()
+        # return (error * mask).sum() / mask.sum().clamp_min(1e-8)
 
 
 def _saccade_vectors(xy):

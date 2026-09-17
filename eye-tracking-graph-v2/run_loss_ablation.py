@@ -52,8 +52,8 @@ EXPERIMENTS = [
         "loss_cfg": [
             {"type": "permutation", "weight": 1.0, "target": "hard"},
             {"type": "doubly_stochastic_cross_entropy", "weight": 1.0, "target": "soft"},
-            {"type": "permutation_wasserstein", "weight": 1.0},
-            {"type": "permutation_reconstruction", "weight": 1.0},
+            {"type": "permutation_wasserstein", "weight": 0.1},
+            {"type": "permutation_reconstruction", "weight": 0.5},
         ],
     },
 ]
