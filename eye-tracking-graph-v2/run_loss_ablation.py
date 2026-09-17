@@ -78,7 +78,7 @@ def build_experiment_config(experiment, args):
     overrides just this experiment's `loss_cfg`/`work_dir`, plus any CLI overrides."""
     cfg = dict(load_config(os.path.join(CONFIG_DIR, "train.yaml")))
     cfg["loss_cfg"] = experiment["loss_cfg"]
-    cfg["work_dir"] = os.path.join("work_dir", "loss_ablation_scale20", experiment["name"])
+    cfg["work_dir"] = os.path.join("work_dir", "loss_ablation", experiment["name"])
 
     if args.h5_path:
         cfg["data"] = dict(cfg["data"])

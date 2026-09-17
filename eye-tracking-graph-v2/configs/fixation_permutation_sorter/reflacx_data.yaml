@@ -24,7 +24,7 @@ paths:
   fixations_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
   metadata_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
   image_root: erda2/eye-tracking/mimic-cxr-jpg/files
-  h5_path: erda2/eye-tracking/normalized_data_softGT_scaled20.h5
+  h5_path: erda2/eye-tracking/normalized_data_softGT.h5
 
 dataset_name: reflacx
 removed_metadata_columns: [id, split, eye_tracking_data_discarded, image, dicom_id, subject_id]
@@ -45,14 +45,17 @@ soft_ground_truth:
   enabled: true
   method: sinkhorn                             # sinkhorn | linear_sum_assignment
   columns: [x_position_norm, y_position_norm]
-  tau: 1.0
+  # Sinkhorn temperature for `-distance / tau` (data.reflacx.reflacx.compute_soft_ground_truth).
+  # `columns` are [0, 1]-normalized, so pairwise Euclidean distances are small (at most
+  # sqrt(2)); at tau=1.0 that barely sharpens Sinkhorn away from a uniform 1/n matrix. Lower
+  # tau to sharpen the soft ground truth toward a hard permutation -- there used to be a
+  # separate `scale` knob that multiplied the distance map instead, but
+  # `-distance / tau == -(distance * s) / (tau * s)` for any s > 0, so it was exactly
+  # redundant with just dividing tau by that same s; this value (1.0 / 20.0) is the tau
+  # equivalent of the most recent tau=1.0, scale=20.0. See `visualize_sinkhorn_tau_sweep.py`,
+  # which demonstrates the tradeoff.
+  tau: 0.05
   n_iters: 20
-  # Multiplies the (Euclidean) distance map before it's turned into a Sinkhorn score
-  # (-distance * scale / tau) -- `columns` are [0, 1]-normalized, so pairwise distances are
-  # small (at most sqrt(2)) and at scale=1.0/tau=1.0 barely sharpen Sinkhorn away from a
-  # uniform 1/n matrix. Raise this to sharpen the soft ground truth toward a hard
-  # permutation. See `visualize_soft_gt_scale.py`.
-  scale: 20.0
 
 # Whether a dataset built via `data.reflacx.reflacx.dataset_kwargs` should load the
 # precomputed `soft_permutation` matrix (requires `soft_ground_truth.enabled` to have been

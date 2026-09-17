@@ -15,16 +15,6 @@ sequence is shorter than `--max-length`, this:
      (Sinkhorn) matrix, the image overlaid with the true fixation path, the image overlaid
      with the predicted path, and the image overlaid with both.
 
-`data.reflacx.reflacx.load_fixations` now bakes `soft_ground_truth.scale` (see
-`configs/fixation_permutation_sorter/reflacx_data.yaml`) directly into the coordinate
-columns *before* they're written to the H5 file, rather than the old recipe of leaving
-coordinates in `[0, 1]` and multiplying the distance map by `scale` just before Sinkhorn.
-So the fixation coordinates this script reads back out of the dataset are already
-pre-scaled -- fine (indeed necessary, to match training) for the distance/Sinkhorn
-computation, but they have to be divided back out by `--coordinate-scale` before being
-turned into pixel coordinates for the image overlay, or the drawn path would land far
-outside the image.
-
     cd eye-tracking-graph-v2
     python visualize_permutation.py \
         --config configs/fixation_permutation_sorter/train.yaml \
@@ -57,7 +47,6 @@ SPLITS = ("train", "val", "test")
 # H5 file was actually built/supervised with.
 DEFAULT_TAU = reflacx.SOFT_GROUND_TRUTH_TAU
 DEFAULT_SINKHORN_ITERS = reflacx.SOFT_GROUND_TRUTH_N_ITERS
-DEFAULT_COORDINATE_SCALE = reflacx.SOFT_GROUND_TRUTH_SCALE
 
 
 def parse_args():
@@ -69,15 +58,6 @@ def parse_args():
     parser.add_argument("--splits", type=str, nargs="+", default=list(SPLITS), choices=list(SPLITS))
     parser.add_argument("--tau", type=float, default=DEFAULT_TAU, help="Sinkhorn temperature for the distance map")
     parser.add_argument("--sinkhorn-iters", type=int, default=DEFAULT_SINKHORN_ITERS)
-    parser.add_argument(
-        "--coordinate-scale",
-        type=float,
-        default=DEFAULT_COORDINATE_SCALE,
-        help="Factor `soft_ground_truth.scale` bakes into the fixation coordinates at preprocessing time "
-        "(data.reflacx.reflacx.load_fixations). Used only to divide the stored coordinates back to [0, 1] "
-        "before drawing them on the image -- the distance map/Sinkhorn matrix are computed directly from "
-        "the (already-scaled) stored coordinates, matching what the model was actually trained on.",
-    )
     parser.add_argument("--seed", type=int, default=0, help="Selects which samples/shuffle are visualized")
     parser.add_argument("--output-dir", type=str, default="work_dir/permutation_visualizations")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -123,11 +103,7 @@ def pairwise_distance_map(coords):
 
 def sinkhorn_normalize(distance, tau, n_iters):
     """Same recipe as `data.reflacx.reflacx.compute_soft_ground_truth`'s `"sinkhorn"` method:
-    `-distance / tau` as the Sinkhorn compatibility score. `compute_soft_ground_truth` no
-    longer multiplies by a separate `scale` here -- `soft_ground_truth.scale` is instead
-    baked into the coordinates themselves at preprocessing time (`load_fixations`), so
-    `distance` already reflects it as long as it was computed from those (already-scaled)
-    coordinates."""
+    `-distance / tau` as the Sinkhorn compatibility score."""
     log_alpha = torch.from_numpy(-distance / tau).float().unsqueeze(0)
     return sinkhorn_norm(log_alpha, n_iters=n_iters)[0].numpy()
 
@@ -146,14 +122,13 @@ def annotate_heatmap(ax, matrix, im, fmt="{:.2f}", max_n_for_text=25):
     contrast against that cell's color. Skipped above `max_n_for_text` per side, since text
     for every cell of a large matrix is unreadable rather than informative.
 
-    At `tau=1.0` over genuinely `[0, 1]`-normalized coordinates (i.e. `soft_ground_truth.scale
-    = 1`), the Sinkhorn-normalized matrix's entries are all close to `1/n` -- e.g. for
-    `n=20`, even the diagonal only reaches ~0.05-0.07, nowhere near 1 -- which is real
-    doubly-stochastic behavior (every row still sums to 1), not a bug, but looks like
-    "everything is 0" on a fixed `vmin=0, vmax=1` color scale. `DEFAULT_COORDINATE_SCALE`
-    (`soft_ground_truth.scale`, now baked into the stored coordinates -- see this module's
-    docstring) sharpens the matrix well away from that flat regime, but these annotations
-    make the actual numbers visible either way."""
+    At `tau=1.0` over `[0, 1]`-normalized coordinates, the Sinkhorn-normalized matrix's
+    entries are all close to `1/n` -- e.g. for `n=20`, even the diagonal only reaches
+    ~0.05-0.07, nowhere near 1 -- which is real doubly-stochastic behavior (every row still
+    sums to 1), not a bug, but looks like "everything is 0" on a fixed `vmin=0, vmax=1` color
+    scale. Lowering `tau` (see `DEFAULT_TAU`, sourced from `soft_ground_truth.tau`) sharpens
+    the matrix well away from that flat regime, but these annotations make the actual numbers
+    visible either way."""
     n = matrix.shape[0]
     if n > max_n_for_text:
         return
@@ -202,7 +177,7 @@ def predict_permutation(model, image, fixations, device):
 
 
 def visualize_sample(
-    model, dataset, sample_index, sample_id, coordinate_indices, tau, n_iters, coordinate_scale, device, out_path
+    model, dataset, sample_index, sample_id, coordinate_indices, tau, n_iters, device, out_path
 ):
     item = dataset[sample_index]
     image = item["image"]  # (C, H, W)
@@ -210,9 +185,6 @@ def visualize_sample(
     inverse_permutation = item["inverse_permutation"].numpy()
     true_permutation = item["permutation"].numpy()
 
-    # Coordinates as stored in the H5 file -- already scaled by `soft_ground_truth.scale`
-    # (see this module's docstring) -- used as-is for the distance map/Sinkhorn matrix, so
-    # they match what the model was actually supervised on.
     shuffled_coords = shuffled_fixations[:, coordinate_indices].numpy()
     original_coords = gather_by_inverse(shuffled_coords, inverse_permutation)  # canonical order
 
@@ -224,11 +196,8 @@ def visualize_sample(
     predicted_coords = gather_by_inverse(shuffled_coords, predicted_inverse)
 
     height, width = image.shape[-2], image.shape[-1]
-    # Divided back out of the stored (scaled) coordinates to recover [0, 1] positions before
-    # mapping onto the image's actual pixel dimensions -- unlike `distance`/`normalized`
-    # above, drawing on the image must undo the scale, not use it.
-    true_px = to_pixels(original_coords / coordinate_scale, width, height)
-    pred_px = to_pixels(predicted_coords / coordinate_scale, width, height)
+    true_px = to_pixels(original_coords, width, height)
+    pred_px = to_pixels(predicted_coords, width, height)
     image_hw = to_image_hw(image)
 
     accuracy = float((predicted_permutation == true_permutation).mean())
@@ -239,9 +208,9 @@ def visualize_sample(
     axes[0].set_title("Pairwise distance map")
     fig.colorbar(im0, ax=axes[0], fraction=0.046)
 
-    # Auto-ranged (not a fixed vmin=0/vmax=1 scale): without `soft_ground_truth.scale`
-    # sharpening things (see `annotate_heatmap`'s docstring), entries are legitimately all
-    # close to 1/n -- a fixed 0-1 scale would crush that real structure to "looks all black".
+    # Auto-ranged (not a fixed vmin=0/vmax=1 scale): at `tau=1.0` over [0, 1]-normalized
+    # coordinates, entries are legitimately all close to 1/n (see `annotate_heatmap`'s
+    # docstring) -- a fixed 0-1 scale would crush that real structure to "looks all black".
     im1 = axes[1].imshow(normalized, cmap="viridis", vmin=0, vmax=normalized.max())
     axes[1].set_title(f"Sinkhorn-normalized (diag mean={np.diagonal(normalized).mean():.3f})")
     fig.colorbar(im1, ax=axes[1], fraction=0.046)
@@ -323,7 +292,6 @@ def main():
                     coordinate_indices,
                     args.tau,
                     args.sinkhorn_iters,
-                    args.coordinate_scale,
                     device,
                     out_path,
                 )

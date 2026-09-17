@@ -50,7 +50,6 @@ SOFT_GROUND_TRUTH_METHOD = REFLACX_CONFIG.soft_ground_truth.method
 SOFT_GROUND_TRUTH_COLUMNS = list(REFLACX_CONFIG.soft_ground_truth.columns)
 SOFT_GROUND_TRUTH_TAU = REFLACX_CONFIG.soft_ground_truth.tau
 SOFT_GROUND_TRUTH_N_ITERS = REFLACX_CONFIG.soft_ground_truth.n_iters
-SOFT_GROUND_TRUTH_SCALE = REFLACX_CONFIG.soft_ground_truth.get("scale", 1.0)
 
 
 def _expand_bounds(bounds):
@@ -121,14 +120,12 @@ def load_image(image_path, resize=None, channel_first=True):
         print(e)
         return np.zeros((1, resize[1], resize[0]), dtype=np.uint8) if channel_first else np.zeros((resize[1], resize[0], 1), dtype=np.uint8)
     
-def load_fixations(fixation_path, normalize=True, image_size=None, scale=None):
+def load_fixations(fixation_path, normalize=True, image_size=None):
     # image_size = (X, Y) = (width, height)
     fixations = pd.read_csv(fixation_path)
     if normalize and image_size is not None:
         fixations['x_position_norm'] = fixations['x_position'] / image_size[0]
         fixations['y_position_norm'] = fixations['y_position'] / image_size[1]
-    if scale is not None:
-        fixations[['x_position_norm', 'y_position_norm']] *= scale
     return fixations
 
 def compute_soft_ground_truth(
@@ -137,7 +134,6 @@ def compute_soft_ground_truth(
     method=SOFT_GROUND_TRUTH_METHOD,
     tau=SOFT_GROUND_TRUTH_TAU,
     n_iters=SOFT_GROUND_TRUTH_N_ITERS,
-    scale=SOFT_GROUND_TRUTH_SCALE,
 ):
     """Builds a soft "ground truth" doubly-stochastic `(n, n)` matrix for one sample's
     fixation sequence, in its original (canonical) order, for use as a target in
@@ -178,16 +174,16 @@ def compute_soft_ground_truth(
             always recovers the identity permutation for genuinely distinct fixations --
             provided mainly for comparison/debugging, not because it's expected to differ
             from a plain hard target in practice.
-        tau, n_iters: forwarded to `sinkhorn_norm` (ignored for `"linear_sum_assignment"`).
-        scale: multiplies the distance map before it's turned into a Sinkhorn compatibility
-            score (`-distance * scale / tau`), ignored for `"linear_sum_assignment"` (which
-            only cares about each row/column's arg-min, unaffected by a uniform rescaling).
-            `columns` defaults to `[0, 1]`-normalized coordinates, where pairwise Euclidean
-            distances are small (at most `sqrt(2)`) -- at `tau=1.0` that barely perturbs
-            Sinkhorn away from a uniform `1/n` matrix (see this module's `SOFT_GROUND_TRUTH_SCALE`
-            default and `visualize_soft_gt_scale.py`, which demonstrates the effect). Raise
-            `scale` to sharpen the normalized matrix toward a hard permutation without having
-            to also rescale `tau` or switch `columns` to pixel space.
+        tau, n_iters: forwarded to `sinkhorn_norm` (`tau` ignored for `"linear_sum_assignment"`,
+            which only cares about each row/column's arg-min, unaffected by a uniform
+            rescaling of the distance map). `columns` defaults to `[0, 1]`-normalized
+            coordinates, where pairwise Euclidean distances are small (at most `sqrt(2)`) --
+            a `tau` of that same order barely perturbs Sinkhorn away from a uniform `1/n`
+            matrix, while a small `tau` (e.g. `tau << 1`) sharpens it towards a hard
+            permutation. Since `-distance / tau == -(distance * s) / (tau * s)` for any
+            `s > 0`, lowering `tau` and multiplying the distance map by a fixed factor have
+            identical effect -- so `tau` alone is the knob to reach for (see
+            `visualize_sinkhorn_tau_sweep.py`, which demonstrates the tradeoff).
     """
     missing = [col for col in columns if col not in fixations.columns]
     if missing:
@@ -245,21 +241,21 @@ def dataset_kwargs(split, config=REFLACX_CONFIG, **overrides):
     return kwargs
 
 
-def get_field(df, resize, normalize, scale):
+def get_field(df, resize, normalize):
     ret_dict = {}
     for index, row in df.iterrows():
         image_path = os.path.join(IMAGE_ROOT, row['image'])
         image = load_image(image_path, resize, channel_first=True)
-        
+
         id_ = row['id']
         split = row['split']
         group = f"{split}/{DATASET_NAME}/{id_}"
-        
+
         metadata = row.drop(REMOVED_COLUMNS)
         image_size = (row['image_size_x'], row['image_size_y'])
         fixations_path = os.path.join(FIXATIONS_ROOT, id_, 'fixations.csv')
-        fixations = load_fixations(fixations_path, normalize, image_size, scale)
-        
+        fixations = load_fixations(fixations_path, normalize, image_size)
+
         yield group, metadata, image, fixations, split
 
 def preprocess(
@@ -274,17 +270,11 @@ def preprocess(
     soft_ground_truth_columns=SOFT_GROUND_TRUTH_COLUMNS,
     soft_ground_truth_tau=SOFT_GROUND_TRUTH_TAU,
     soft_ground_truth_n_iters=SOFT_GROUND_TRUTH_N_ITERS,
-    soft_ground_truth_scale=SOFT_GROUND_TRUTH_SCALE,
     out_of_bounds=OUT_OF_BOUNDS,
     coordinate_columns=COORDINATE_COLUMNS,
     coordinate_bounds=COORDINATE_BOUNDS,
 ):
     # write_dataframe(h5_path, group, df, mode='a', columns=df.columns, column_attrs=None)
-    if soft_ground_truth_scale is not None:
-        if soft_ground_truth_scale <= 0:
-            raise ValueError(f"soft_ground_truth_scale must be > 0, got {soft_ground_truth_scale}")
-        else:
-            coordinate_bounds = tuple((np.array(coordinate_bounds) * soft_ground_truth_scale).tolist())
     dfs = []
     count = 0
     count_stat = {(split.upper(), str(phase)): 0 for split in ['train', 'val', 'test'] for phase in range(1, 4)}
@@ -293,7 +283,7 @@ def preprocess(
             df = pd.read_csv(os.path.join(METADATA_ROOT, path))
             df = refine_metadata_fields(df)
 
-            for group, metadata, image, fixations, split in get_field(df, resize, normalize, scale=soft_ground_truth_scale):
+            for group, metadata, image, fixations, split in get_field(df, resize, normalize):
                 phase = path.split('_')[-1].split('.')[0]
                 metadata['phase'] = phase # add phase to metadata
 
@@ -321,7 +311,6 @@ def preprocess(
                             method=soft_ground_truth_method,
                             tau=soft_ground_truth_tau,
                             n_iters=soft_ground_truth_n_iters,
-                            scale=soft_ground_truth_scale,
                         )
                         write_h5(h5file, group, 'soft_permutation', soft_gt)
                 else:
