@@ -24,7 +24,7 @@ paths:
   fixations_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
   metadata_root: erda2/eye-tracking/physionet.org/files/reflacx-xray-localization/1.0.0/main_data
   image_root: erda2/eye-tracking/mimic-cxr-jpg/files
-  h5_path: erda2/eye-tracking/normalized_data_softGT_scaled.h5
+  h5_path: erda2/eye-tracking/normalized_data_softGT_scaled20.h5
 
 dataset_name: reflacx
 removed_metadata_columns: [id, split, eye_tracking_data_discarded, image, dicom_id, subject_id]
@@ -52,7 +52,7 @@ soft_ground_truth:
   # small (at most sqrt(2)) and at scale=1.0/tau=1.0 barely sharpen Sinkhorn away from a
   # uniform 1/n matrix. Raise this to sharpen the soft ground truth toward a hard
   # permutation. See `visualize_soft_gt_scale.py`.
-  scale: 224.0
+  scale: 20.0
 
 # Whether a dataset built via `data.reflacx.reflacx.dataset_kwargs` should load the
 # precomputed `soft_permutation` matrix (requires `soft_ground_truth.enabled` to have been

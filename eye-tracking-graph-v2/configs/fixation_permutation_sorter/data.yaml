@@ -17,7 +17,7 @@
 data:
   train_dataset:
     type: permuted_h5
-    h5_path: erda2/eye-tracking/normalized_data_softGT_scaled.h5
+    h5_path: erda2/eye-tracking/normalized_data_softGT_scaled20.h5
     split: TRAIN
     dataset_name: reflacx
     fixation_columns: [x_position_norm, y_position_norm]
@@ -33,7 +33,7 @@ data:
 
   val_dataset:
     type: permuted_h5
-    h5_path: erda2/eye-tracking/normalized_data_softGT_scaled.h5
+    h5_path: erda2/eye-tracking/normalized_data_softGT_scaled20.h5
     split: VAL
     dataset_name: reflacx
     fixation_columns: [x_position_norm, y_position_norm]
@@ -50,7 +50,7 @@ data:
 
   test_dataset:
     type: permuted_h5
-    h5_path: erda2/eye-tracking/normalized_data_softGT_scaled.h5
+    h5_path: erda2/eye-tracking/normalized_data_softGT_scaled20.h5
     split: TEST
     dataset_name: reflacx
     fixation_columns: [x_position_norm, y_position_norm]
