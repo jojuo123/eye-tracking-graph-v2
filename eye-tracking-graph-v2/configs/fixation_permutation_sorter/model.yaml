@@ -30,7 +30,7 @@ model:
   context_dropout: 0.1
 
   sinkhorn_cfg:
-    tau: 0.5
+    tau: 0.2
     n_iters: 20
     noise_factor: 1.0
-    n_samples: 1
+    n_samples: 5

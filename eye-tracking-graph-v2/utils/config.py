@@ -35,6 +35,15 @@ class Config(dict):
             raise AttributeError(key) from e
 
 
+def config_to_dict(cfg) -> dict:
+    """Recursively convert a Config (or nested dict/list) to plain Python dicts/lists."""
+    if isinstance(cfg, dict):
+        return {k: config_to_dict(v) for k, v in cfg.items()}
+    if isinstance(cfg, list):
+        return [config_to_dict(v) for v in cfg]
+    return cfg
+
+
 def load_config(path: str) -> Config:
     """Loads a YAML config, merging in any files listed under a top-level `includes:` key
     first -- so a big config can be assembled from several smaller, independently-readable

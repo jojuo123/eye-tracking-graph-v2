@@ -11,6 +11,7 @@ import os
 import time
 
 import torch
+import yaml
 
 from dataloaders import build_dataloader
 from models import build_model
@@ -19,6 +20,7 @@ from trainers.inferrer import Inferrer
 from trainers.optimizers.optimizers import build_optimizer
 from trainers.schedulers.schedulers import build_scheduler
 from utils.checkpoint import CheckpointManager
+from utils.config import config_to_dict
 from utils.logger import get_logger
 from utils.meter import MetricTracker
 from utils.seed import set_seed
@@ -56,6 +58,11 @@ class BaseTrainer:
         """Construct model, dataloaders, optimizer, scheduler, checkpoint manager,
         evaluator and inferrer from `self.cfg`. Must be called before `train()`."""
         cfg = self.cfg
+
+        config_path = os.path.join(self.work_dir, "config.yaml")
+        with open(config_path, "w") as f:
+            yaml.dump(config_to_dict(cfg), f, default_flow_style=False, sort_keys=False)
+        self.logger.info(f"Config saved to {config_path}")
 
         self.model = build_model(cfg["model"]).to(self.device)
         self.logger.info(f"Built model '{cfg['model']['type']}' with {self.model.num_parameters:,} trainable params")
