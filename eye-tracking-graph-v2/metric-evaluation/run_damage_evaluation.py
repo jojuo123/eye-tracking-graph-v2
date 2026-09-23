@@ -70,10 +70,22 @@ METRIC_GROUPS = [
 ALL_METRICS = [m for _, group in METRIC_GROUPS for m in group]
 
 
-def evaluate_pair(coords, perm, crqa_radius=0.05):
+def evaluate_pair(
+    coords,
+    perm,
+    eps_values=(0.05,),
+    crqa_radius_values=(0.05,),
+    grid_sizes=(5,),
+    erp_gap_points=((0.0, 0.0),),
+):
     """`coords`: `(n, 2)` original scanpath. `perm`: a permutation of `0..n-1` (see
-    `perturbations.py`) -- the damaged scanpath is `coords[perm]`. Returns a flat
-    `{metric_name: value}` dict covering every metric in `ALL_METRICS`. Count-based
+    `perturbations.py`) -- the damaged scanpath is `coords[perm]`. Returns
+    `{metric_name: {param_label: value}}` covering every metric in `ALL_METRICS`:
+    metrics with no free parameter get a single `"default"` entry; metrics that take
+    one (`lcss`/`edr`'s `eps`, the CRQA family's `radius`, `string_edit_distance`/
+    `scanmatch`'s AOI `grid_shape`, `erp`'s `gap_point`) get one entry per value in
+    the corresponding `*_values`/`grid_sizes`/`erp_gap_points` argument, so callers
+    can see both severity-sensitivity and parameter-sensitivity at once. Count-based
     permutation distances are normalized by their maximum possible value (so they're
     comparable across scanpaths of different length); `dtw`/`string_edit_distance`/
     `edr` use those functions' own `normalize=True`; `erp` is divided by `n` (average
@@ -88,28 +100,41 @@ def evaluate_pair(coords, perm, crqa_radius=0.05):
     max_footrule = (n * n) // 2
 
     values = {
-        "hamming": hamming_distance(identity, perm) / n,
-        "kendall_tau": (kendall_tau_distance(identity, perm) / max_kendall) if max_kendall > 0 else 0.0,
-        "spearman_footrule": (spearman_footrule_distance(identity, perm) / max_footrule) if max_footrule > 0 else 0.0,
-        "cayley": (cayley_distance(identity, perm) / (n - 1)) if n > 1 else 0.0,
-        "ulam": (ulam_distance(identity, perm) / (n - 1)) if n > 1 else 0.0,
-        "string_edit_distance": string_edit_distance(coords, damaged, normalize=True),
-        "scanmatch": scanmatch(coords, damaged),
-        "edr": edr_distance(coords, damaged, normalize=True),
-        "dtw": dynamic_time_warping(coords, damaged, normalize=True),
-        "lcss": lcss_distance(coords, damaged),
-        "discrete_frechet": discrete_frechet_distance(coords, damaged),
-        "hausdorff": hausdorff_distance(coords, damaged),
-        "erp": erp_distance(coords, damaged) / n if n > 0 else 0.0,
+        "hamming": {"default": hamming_distance(identity, perm) / n},
+        "kendall_tau": {
+            "default": (kendall_tau_distance(identity, perm) / max_kendall) if max_kendall > 0 else 0.0
+        },
+        "spearman_footrule": {
+            "default": (spearman_footrule_distance(identity, perm) / max_footrule) if max_footrule > 0 else 0.0
+        },
+        "cayley": {"default": (cayley_distance(identity, perm) / (n - 1)) if n > 1 else 0.0},
+        "ulam": {"default": (ulam_distance(identity, perm) / (n - 1)) if n > 1 else 0.0},
+        "dtw": {"default": dynamic_time_warping(coords, damaged, normalize=True)},
+        "discrete_frechet": {"default": discrete_frechet_distance(coords, damaged)},
+        "hausdorff": {"default": hausdorff_distance(coords, damaged)},
+    }
+
+    values["string_edit_distance"] = {
+        f"grid={g}x{g}": string_edit_distance(coords, damaged, grid_shape=(g, g), normalize=True)
+        for g in grid_sizes
+    }
+    values["scanmatch"] = {f"grid={g}x{g}": scanmatch(coords, damaged, grid_shape=(g, g)) for g in grid_sizes}
+    values["edr"] = {f"eps={eps:g}": edr_distance(coords, damaged, eps=eps, normalize=True) for eps in eps_values}
+    values["lcss"] = {f"eps={eps:g}": lcss_distance(coords, damaged, eps=eps) for eps in eps_values}
+    values["erp"] = {
+        f"gap=({gp[0]:g},{gp[1]:g})": (erp_distance(coords, damaged, gap_point=gp) / n if n > 0 else 0.0)
+        for gp in erp_gap_points
     }
 
     mm = multimatch(coords, damaged)
     for dim in MULTIMATCH_DIMS:
-        values[dim] = mm[dim] if mm[dim] is not None else float("nan")
+        values[dim] = {"default": mm[dim] if mm[dim] is not None else float("nan")}
 
-    crqa = cross_recurrence_analysis(coords, damaged, radius=crqa_radius)
-    for key in CRQA_METRICS:
-        values[key] = crqa[key] if crqa[key] is not None else float("nan")
+    for radius in crqa_radius_values:
+        crqa = cross_recurrence_analysis(coords, damaged, radius=radius)
+        label = f"radius={radius:g}"
+        for key in CRQA_METRICS:
+            values.setdefault(key, {})[label] = crqa[key] if crqa[key] is not None else float("nan")
 
     return values
 
@@ -135,46 +160,64 @@ def load_local_reflacx_sequences(
     return sequences
 
 
-def run_experiment(sequences, levels, n_repeats, seed=0, crqa_radius=0.05):
+def run_experiment(
+    sequences,
+    levels,
+    n_repeats,
+    seed=0,
+    eps_values=(0.05,),
+    crqa_radius_values=(0.05,),
+    grid_sizes=(5,),
+    erp_gap_points=((0.0, 0.0),),
+):
     """For every (perturbation type, severity level), draws `n_repeats` random
     damage realizations per sample (this is the "good amount of artificial
     orderings per sample" the averaging relies on -- a single realization at a
     given level is a noisy draw, e.g. which adjacent pairs `local_swaps` happens to
     pick; several repeats per sample, pooled with all other samples, is what turns
-    that into a stable curve) and evaluates every metric, comparing each damaged
+    that into a stable curve) and evaluates every metric -- at every swept parameter
+    value, for metrics that take one (see `evaluate_pair`) -- comparing each damaged
     scanpath back to its own original.
 
-    Returns `{perturbation_name: {metric_name: [(level, mean, std, n_samples), ...]}}`.
+    Returns
+    `{perturbation_name: {metric_name: {param_label: [(level, mean, std, n_samples), ...]}}}`.
     `swap_nearby_locations` silently skips (sample, repeat) draws where the sample
-    has no eligible near-revisit pair at the given `crqa_radius`-scaled search radius
+    has no eligible near-revisit pair at that draw's search radius
     (`perturbations.swap_nearby_locations` returns the identity permutation in that
     case) -- counting those as "zero damage" would understate the metrics' true
     sensitivity by diluting the average with samples the perturbation couldn't even
     apply to.
     """
     rng = np.random.default_rng(seed)
-    results = {name: {m: [] for m in ALL_METRICS} for name in PERTURBATIONS}
+    results = {name: {m: {} for m in ALL_METRICS} for name in PERTURBATIONS}
 
     for pert_name, pert_fn in PERTURBATIONS.items():
         needs_coords = pert_name in NEEDS_COORDS
         for level in levels:
-            per_metric_samples = {m: [] for m in ALL_METRICS}
+            per_metric_param_samples = {m: {} for m in ALL_METRICS}
             for coords in sequences.values():
                 n = coords.shape[0]
                 for _ in range(n_repeats):
                     perm = pert_fn(n, level, rng, coords=coords if needs_coords else None)
                     if pert_name == "swap_nearby_locations" and level > 0 and np.array_equal(perm, np.arange(n)):
                         continue
-                    vals = evaluate_pair(coords, perm, crqa_radius=crqa_radius)
+                    vals = evaluate_pair(
+                        coords,
+                        perm,
+                        eps_values=eps_values,
+                        crqa_radius_values=crqa_radius_values,
+                        grid_sizes=grid_sizes,
+                        erp_gap_points=erp_gap_points,
+                    )
                     for m in ALL_METRICS:
-                        v = vals[m]
-                        if not (isinstance(v, float) and np.isnan(v)):
-                            per_metric_samples[m].append(v)
+                        for label, v in vals[m].items():
+                            if not (isinstance(v, float) and np.isnan(v)):
+                                per_metric_param_samples[m].setdefault(label, []).append(v)
             for m in ALL_METRICS:
-                samples = per_metric_samples[m]
-                mean = float(np.mean(samples)) if samples else float("nan")
-                std = float(np.std(samples)) if samples else float("nan")
-                results[pert_name][m].append([level, mean, std, len(samples)])
+                for label, samples in per_metric_param_samples[m].items():
+                    mean = float(np.mean(samples)) if samples else float("nan")
+                    std = float(np.std(samples)) if samples else float("nan")
+                    results[pert_name][m].setdefault(label, []).append([level, mean, std, len(samples)])
     return results
 
 
@@ -190,6 +233,11 @@ SURFACE, PAGE = "#fcfcfb", "#f9f9f7"
 GRID, AXIS_LINE = "#e1e0d9", "#c3c2b7"
 TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED = "#0b0b0b", "#52514e", "#898781"
 
+# One metric = one color (fixed across its param sweep, so the eye groups by metric
+# first); one parameter value = one line style, in sweep order, so the eye can then
+# read severity within a metric.
+LINESTYLES = ["-", "--", ":", "-."]
+
 
 def _style_axes(ax):
     ax.set_facecolor(SURFACE)
@@ -203,27 +251,37 @@ def _style_axes(ax):
 
 
 def plot_perturbation(pert_name, pert_results, out_dir):
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig, axes = plt.subplots(2, 3, figsize=(19, 9))
     fig.patch.set_facecolor(PAGE)
     for ax, (group_title, metric_names) in zip(axes.ravel(), METRIC_GROUPS):
         _style_axes(ax)
         for color, metric in zip(PALETTE, metric_names):
-            series = pert_results[metric]
-            xs = [row[0] for row in series]
-            ys = [row[1] for row in series]
-            stds = [row[2] for row in series]
-            ax.plot(xs, ys, color=color, linewidth=1.8, marker="o", markersize=4.5, label=metric)
-            lo = [y - s for y, s in zip(ys, stds)]
-            hi = [y + s for y, s in zip(ys, stds)]
-            ax.fill_between(xs, lo, hi, color=color, alpha=0.12, linewidth=0)
+            param_series = pert_results[metric]  # {param_label: [(level, mean, std, n), ...]}
+            single_default = list(param_series.keys()) == ["default"]
+            for i, (label, series) in enumerate(param_series.items()):
+                xs = [row[0] for row in series]
+                ys = [row[1] for row in series]
+                stds = [row[2] for row in series]
+                linestyle = LINESTYLES[i % len(LINESTYLES)]
+                legend_label = metric if single_default else f"{metric} ({label})"
+                ax.plot(
+                    xs, ys, color=color, linewidth=1.6, marker="o", markersize=3.5,
+                    linestyle=linestyle, label=legend_label,
+                )
+                lo = [y - s for y, s in zip(ys, stds)]
+                hi = [y + s for y, s in zip(ys, stds)]
+                ax.fill_between(xs, lo, hi, color=color, alpha=0.10, linewidth=0)
         ax.set_title(group_title, fontsize=9.5, color=TEXT_PRIMARY, loc="left")
         ax.set_xlabel("severity level", fontsize=8, color=TEXT_SECONDARY)
         ax.set_xlim(-0.02, 1.02)
-        ax.legend(fontsize=7, frameon=False, labelcolor=TEXT_SECONDARY, loc="best")
+        ax.legend(
+            fontsize=6, frameon=False, labelcolor=TEXT_SECONDARY,
+            loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0,
+        )
     fig.suptitle(f"Damage type: {pert_name}", fontsize=13, color=TEXT_PRIMARY, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     out_path = os.path.join(out_dir, f"{pert_name}.png")
-    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -238,13 +296,34 @@ def main():
     parser.add_argument("--max-fixations", type=int, default=100)
     parser.add_argument("--levels", type=float, nargs="+", default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     parser.add_argument("--n-repeats", type=int, default=5, help="random damage realizations per sample per level")
-    parser.add_argument("--crqa-radius", type=float, default=0.05)
+    parser.add_argument(
+        "--crqa-radius-values", type=float, nargs="+", default=[0.03, 0.05, 0.08],
+        help="cross_recurrence_analysis's `radius`, swept independently of severity",
+    )
+    parser.add_argument(
+        "--eps-values", type=float, nargs="+", default=[0.025, 0.05, 0.1],
+        help="lcss/edr's spatial match threshold `eps`, swept independently of severity",
+    )
+    parser.add_argument(
+        "--grid-sizes", type=int, nargs="+", default=[3, 5, 8],
+        help="string_edit_distance/scanmatch's AOI grid resolution (n -> an n x n grid)",
+    )
+    parser.add_argument(
+        "--erp-gap-points", type=float, nargs="+", default=[0.0, 0.0, 0.5, 0.5],
+        help="erp's reference gap point(s), as flat x,y pairs, e.g. `0 0 0.5 0.5` for two points",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--output-dir",
         default=os.path.join(os.path.dirname(__file__), "..", "work_dir", "metric_damage_curves"),
     )
     args = parser.parse_args()
+
+    if len(args.erp_gap_points) % 2 != 0:
+        parser.error("--erp-gap-points must be a flat list of x,y pairs (even count)")
+    erp_gap_points = [
+        (args.erp_gap_points[i], args.erp_gap_points[i + 1]) for i in range(0, len(args.erp_gap_points), 2)
+    ]
 
     os.makedirs(args.output_dir, exist_ok=True)
     sequences = load_local_reflacx_sequences(
@@ -254,7 +333,14 @@ def main():
     print(f"Loaded {len(sequences)} scanpaths from {args.h5_path}: lengths {lengths}")
 
     results = run_experiment(
-        sequences, args.levels, args.n_repeats, seed=args.seed, crqa_radius=args.crqa_radius
+        sequences,
+        args.levels,
+        args.n_repeats,
+        seed=args.seed,
+        eps_values=args.eps_values,
+        crqa_radius_values=args.crqa_radius_values,
+        grid_sizes=args.grid_sizes,
+        erp_gap_points=erp_gap_points,
     )
 
     with open(os.path.join(args.output_dir, "results.json"), "w") as f:
