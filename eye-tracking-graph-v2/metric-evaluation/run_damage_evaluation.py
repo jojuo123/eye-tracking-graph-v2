@@ -16,11 +16,53 @@ dependencies.
 Usage: `python3 run_damage_evaluation.py` (uses this repo's local
 `reflacx_data.h5` smoke-test file, 12 samples, by default -- see `--h5-path` to
 point at a larger H5 file, e.g. once ERDA is mounted).
+
+Long runs on a time-limited cluster: the sweep is checkpointed, so the full
+REFLACX TRAIN split doesn't have to fit in one job's walltime. Results are
+written to `results.csv` (long format, one row per damage type / metric /
+parameter / severity level) alongside `results.json` and the figures, and
+progress is saved to `checkpoint.json` every `--checkpoint-every` seconds and on
+SIGTERM/SIGUSR1 (which is what SLURM sends when the walltime runs out).
+Re-running the *same command* with the same `--output-dir` picks up where the
+last job stopped; pass `--fresh` to start over instead. Every (damage type,
+level, sample) work unit draws from its own seeded generator, so a resumed run
+produces exactly the numbers an uninterrupted one would have, given the same
+`--workers`/`--chunk-size` (see `--workers` below for why that qualifier is
+there).
+
+Multiprocessing (`--workers N`): the per-pair metrics are pure numpy/Python --
+no I/O, no shared state -- so the sweep parallelizes over OS processes with no
+special tricks *once the data is loaded*. The one thing that doesn't
+parallelize is `h5py`: an open `h5py.File` can't be handed to worker processes
+(it isn't picklable, and HDF5's C library isn't fork-safe once a file is open --
+forking mid-read can corrupt the parent's handle). The workaround is the
+structure this script already had before `--workers` existed: `main()` fully
+reads every scanpath into plain numpy arrays via `load_local_reflacx_sequences`
+*and closes the H5 file* before the sweep starts. Workers are only ever handed
+those arrays (through a `Pool` initializer, once, not per task) -- `h5py` is
+imported in worker processes (since they load this module) but never called.
 """
 
 import argparse
+import csv
+import hashlib
 import json
+import multiprocessing as mp
 import os
+import signal
+import sys
+import time
+
+# Cap BLAS/OpenMP threading to 1 before numpy (or anything that pulls it in) loads.
+# Every metric call here works on tiny arrays -- a few hundred points at most -- so
+# BLAS's own thread pool is pure scheduling overhead even single-process; left at its
+# default (often "all cores"), it multiplies with --workers's process-level
+# parallelism into far more threads than the job actually has cores, which thrashes
+# rather than helps. Only affects this process's env, not the calling shell's.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import h5py
 import matplotlib
@@ -68,6 +110,7 @@ METRIC_GROUPS = [
     ("Trajectory distances, spatial units", TRAJ_SPATIAL),
 ]
 ALL_METRICS = [m for _, group in METRIC_GROUPS for m in group]
+METRIC_GROUP_OF = {m: title for title, group in METRIC_GROUPS for m in group}
 
 
 def evaluate_pair(
@@ -160,7 +203,274 @@ def load_local_reflacx_sequences(
     return sequences
 
 
-def run_experiment(
+# ---------------------------------------------------------------------------
+# Resumable sweep: running totals + a work cursor, checkpointed to disk
+# ---------------------------------------------------------------------------
+#
+# The sweep is one pass over `len(sequences) * len(PERTURBATIONS) * len(levels)`
+# work units, in a fixed order, each unit contributing `n_repeats` damage draws for
+# one (sample, damage type, severity level). The order is sample-major on purpose:
+# every sample contributes to every (damage type, level) cell before the next sample
+# starts, so a run that gets cut off early still has all of the curves, just averaged
+# over fewer scanpaths -- rather than a few finished curves and nothing at all for
+# the remaining damage types.
+#
+# Instead of keeping every draw in memory and averaging at the end, each unit folds
+# its draws into running `[count, sum, sum_of_squares]` totals per (damage type,
+# metric, param label, level) -- from which the pooled mean and std are recoverable
+# exactly, in a few thousand numbers rather than the tens of millions of raw draws a
+# full-split run produces. Totals plus the index of the next unfinished unit are the
+# entire checkpoint, so a job killed at its walltime resumes from the last flush.
+#
+# Each unit seeds its own generator from (seed, unit indices) rather than drawing
+# from one stream threaded through the whole sweep: that's what makes a resumed run
+# reproduce the uninterrupted run's numbers exactly, instead of depending on where
+# it was cut. (It also means this version's numbers differ from the pre-checkpoint
+# version's -- same distribution, different draws.)
+
+CHECKPOINT_VERSION = 1
+
+
+def _unit_rng(seed, pert_index, level_index, sample_index):
+    return np.random.default_rng([seed, pert_index, level_index, sample_index])
+
+
+def new_accumulator():
+    """`{pert_name: {metric: {param_label: {level_index: [count, sum, sumsq]}}}}`."""
+    return {name: {m: {} for m in ALL_METRICS} for name in PERTURBATIONS}
+
+
+def accumulate(accum, pert_name, level_index, values):
+    for m in ALL_METRICS:
+        for label, v in values[m].items():
+            if isinstance(v, float) and np.isnan(v):
+                continue
+            by_level = accum[pert_name][m].setdefault(label, {})
+            totals = by_level.setdefault(level_index, [0, 0.0, 0.0])
+            totals[0] += 1
+            totals[1] += float(v)
+            totals[2] += float(v) * float(v)
+
+
+def summarize(accum, levels):
+    """Running totals -> the shape the plotting/JSON side expects:
+    `{pert_name: {metric: {param_label: [[level, mean, std, n_draws], ...]}}}`,
+    ordered by severity level and skipping levels with no draws yet (so a partial
+    run still plots and exports)."""
+    results = {}
+    for pert_name, per_metric in accum.items():
+        results[pert_name] = {}
+        for m in ALL_METRICS:
+            results[pert_name][m] = {}
+            for label, by_level in per_metric.get(m, {}).items():
+                series = []
+                for level_index, level in enumerate(levels):
+                    totals = by_level.get(level_index) or by_level.get(str(level_index))
+                    if not totals or totals[0] == 0:
+                        continue
+                    count, total, total_sq = totals
+                    mean = total / count
+                    var = max(total_sq / count - mean * mean, 0.0)  # population std, as np.std
+                    series.append([level, mean, var**0.5, count])
+                if series:
+                    results[pert_name][m][label] = series
+    return results
+
+
+def _config_fingerprint(args, erp_gap_points, sample_ids):
+    """Identifies the sweep a checkpoint belongs to: resuming into a *different*
+    sweep would silently pool incomparable draws, so the parameters, the sample list
+    and the metric set all feed the hash."""
+    payload = json.dumps(
+        {
+            "version": CHECKPOINT_VERSION,
+            "levels": list(args.levels),
+            "n_repeats": args.n_repeats,
+            "seed": args.seed,
+            "eps_values": list(args.eps_values),
+            "crqa_radius_values": list(args.crqa_radius_values),
+            "grid_sizes": list(args.grid_sizes),
+            "erp_gap_points": [list(p) for p in erp_gap_points],
+            "split": args.split,
+            "dataset_name": args.dataset_name,
+            "max_fixations": args.max_fixations,
+            "sample_ids": list(sample_ids),
+            "perturbations": list(PERTURBATIONS),
+            "metrics": ALL_METRICS,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _write_atomic(path, write_fn):
+    """Write via a temp file + `os.replace`, so a job killed mid-write leaves the
+    previous checkpoint intact rather than a truncated one."""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", newline="") as f:
+        write_fn(f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def save_checkpoint(path, fingerprint, cursor, units_total, accum, elapsed):
+    state = {
+        "version": CHECKPOINT_VERSION,
+        "fingerprint": fingerprint,
+        "cursor": cursor,
+        "units_total": units_total,
+        "elapsed_seconds": elapsed,
+        "accum": accum,
+    }
+    _write_atomic(path, lambda f: json.dump(state, f))
+
+
+def load_checkpoint(path, fingerprint):
+    """Returns `(cursor, accum, elapsed)`, or `None` if there's nothing to resume.
+    Raises on a checkpoint from a different sweep rather than silently discarding
+    or mixing it."""
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        state = json.load(f)
+    if state.get("fingerprint") != fingerprint:
+        raise SystemExit(
+            f"{path} was written by a run with different settings (different levels, seed, swept\n"
+            "parameters, or input samples), so its partial totals can't be pooled with this run's.\n"
+            "Re-run with the original settings to resume it, or pass --fresh to discard it, or point\n"
+            "--output-dir somewhere else."
+        )
+    accum = new_accumulator()
+    for pert_name, per_metric in state["accum"].items():
+        if pert_name not in accum:
+            continue
+        for m, by_label in per_metric.items():
+            for label, by_level in by_label.items():
+                accum[pert_name][m][label] = {int(k): list(v) for k, v in by_level.items()}
+    return state["cursor"], accum, state.get("elapsed_seconds", 0.0)
+
+
+def write_results_csv(path, results):
+    """Long format -- one row per (damage type, metric, swept parameter, severity
+    level) -- so the curves load straight into pandas/R without unpacking the nested
+    JSON. `n_draws` is the number of (sample, repeat) draws behind the mean, which
+    varies for `swap_nearby_locations` (see `run_sweep`)."""
+    def write(f):
+        writer = csv.writer(f)
+        writer.writerow(
+            ["perturbation", "metric", "metric_group", "param_label", "level", "mean", "std", "n_draws"]
+        )
+        for pert_name, per_metric in results.items():
+            for m in ALL_METRICS:
+                for label, series in per_metric.get(m, {}).items():
+                    for level, mean, std, count in series:
+                        writer.writerow(
+                            [pert_name, m, METRIC_GROUP_OF[m], label, level, f"{mean:.10g}", f"{std:.10g}", count]
+                        )
+
+    _write_atomic(path, write)
+
+
+def merge_accumulators(dst, src):
+    """Folds `src`'s running totals (see `new_accumulator`) into `dst`'s, in place --
+    how a parallel worker's per-chunk totals get pooled into the main process's
+    running accumulator."""
+    for pert_name, per_metric in src.items():
+        for m, by_label in per_metric.items():
+            for label, by_level in by_label.items():
+                dst_by_level = dst[pert_name][m].setdefault(label, {})
+                for level_index, (count, total, total_sq) in by_level.items():
+                    dst_totals = dst_by_level.setdefault(level_index, [0, 0.0, 0.0])
+                    dst_totals[0] += count
+                    dst_totals[1] += total
+                    dst_totals[2] += total_sq
+
+
+def _evaluate_unit(
+    accum, unit, coords_list, pert_items, levels, seed, n_repeats,
+    eps_values, crqa_radius_values, grid_sizes, erp_gap_points,
+):
+    """Runs one (sample, damage type, severity level) work unit -- `n_repeats` damage
+    draws, each evaluated against every metric -- and folds the results into `accum`.
+    Shared by the serial and parallel-worker paths in `run_sweep`, so both draw and
+    seed identically; see `run_sweep` for `unit`'s indexing and the
+    `swap_nearby_locations` skip rule."""
+    n_levels = len(levels)
+    sample_index, rest = divmod(unit, len(pert_items) * n_levels)
+    pert_index, level_index = divmod(rest, n_levels)
+    pert_name, pert_fn = pert_items[pert_index]
+    level = levels[level_index]
+    coords = coords_list[sample_index]
+    n = coords.shape[0]
+    needs_coords = pert_name in NEEDS_COORDS
+    rng = _unit_rng(seed, pert_index, level_index, sample_index)
+
+    for _ in range(n_repeats):
+        perm = pert_fn(n, level, rng, coords=coords if needs_coords else None)
+        if pert_name == "swap_nearby_locations" and level > 0 and np.array_equal(perm, np.arange(n)):
+            continue
+        vals = evaluate_pair(
+            coords,
+            perm,
+            eps_values=eps_values,
+            crqa_radius_values=crqa_radius_values,
+            grid_sizes=grid_sizes,
+            erp_gap_points=erp_gap_points,
+        )
+        accumulate(accum, pert_name, level_index, vals)
+
+
+# ---------------------------------------------------------------------------
+# Worker-process side of `--workers`: everything below runs inside a `Pool` worker,
+# never in the main process. State is handed to each worker exactly once, via
+# `Pool`'s `initializer`, and cached in `_worker_state` -- not per task -- since
+# `coords_list` (the whole sweep's input data) is the one thing too big to want to
+# re-send per chunk. `PERTURBATIONS`/`evaluate_pair`/etc. need no such handoff: each
+# worker process loads this module itself (inherited via fork, or re-imported under
+# spawn), so its own copy of those module-level globals is already there.
+# ---------------------------------------------------------------------------
+
+_worker_state = {}
+
+
+def _init_worker(coords_list, levels, seed, n_repeats, eps_values, crqa_radius_values, grid_sizes, erp_gap_points):
+    # SLURM (and an interactive Ctrl-C) delivers SIGTERM/SIGUSR1 to the whole process
+    # group, i.e. to workers too, not just the main process. Workers ignore them: the
+    # main process's own handler is what decides when to stop (see `main`), by simply
+    # not submitting another batch -- a worker dying mid-chunk would instead surface
+    # as a `pool.map` exception and lose that chunk's totals, checkpointed or not.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    _worker_state.update(
+        coords_list=coords_list,
+        pert_items=list(PERTURBATIONS.items()),
+        levels=levels,
+        seed=seed,
+        n_repeats=n_repeats,
+        eps_values=eps_values,
+        crqa_radius_values=crqa_radius_values,
+        grid_sizes=grid_sizes,
+        erp_gap_points=erp_gap_points,
+    )
+
+
+def _process_chunk(unit_range):
+    """Runs work units `[start, stop)` against this worker's cached `_worker_state`
+    and returns `(start, stop, local_accum)` -- a fresh accumulator holding just this
+    chunk's totals, for the main process to fold in via `merge_accumulators`."""
+    start, stop = unit_range
+    st = _worker_state
+    local_accum = new_accumulator()
+    for unit in range(start, stop):
+        _evaluate_unit(
+            local_accum, unit, st["coords_list"], st["pert_items"], st["levels"], st["seed"], st["n_repeats"],
+            st["eps_values"], st["crqa_radius_values"], st["grid_sizes"], st["erp_gap_points"],
+        )
+    return start, stop, local_accum
+
+
+def run_sweep(
     sequences,
     levels,
     n_repeats,
@@ -169,6 +479,12 @@ def run_experiment(
     crqa_radius_values=(0.05,),
     grid_sizes=(5,),
     erp_gap_points=((0.0, 0.0),),
+    accum=None,
+    start_unit=0,
+    on_progress=None,
+    should_stop=None,
+    workers=1,
+    chunk_size=8,
 ):
     """For every (perturbation type, severity level), draws `n_repeats` random
     damage realizations per sample (this is the "good amount of artificial
@@ -179,46 +495,72 @@ def run_experiment(
     value, for metrics that take one (see `evaluate_pair`) -- comparing each damaged
     scanpath back to its own original.
 
-    Returns
-    `{perturbation_name: {metric_name: {param_label: [(level, mean, std, n_samples), ...]}}}`.
+    Folds each draw into `accum`'s running totals (see `new_accumulator`) and
+    returns `(accum, next_unit)`: `next_unit == units_total` means the sweep
+    finished, anything less means `should_stop` asked it to stop early and the
+    caller should checkpoint and exit. `on_progress(next_unit, units_total)` is
+    called after every work unit (`workers <= 1`) or every completed batch of chunks
+    (`workers > 1`), for periodic checkpointing.
+
     `swap_nearby_locations` silently skips (sample, repeat) draws where the sample
     has no eligible near-revisit pair at that draw's search radius
     (`perturbations.swap_nearby_locations` returns the identity permutation in that
     case) -- counting those as "zero damage" would understate the metrics' true
     sensitivity by diluting the average with samples the perturbation couldn't even
     apply to.
-    """
-    rng = np.random.default_rng(seed)
-    results = {name: {m: {} for m in ALL_METRICS} for name in PERTURBATIONS}
 
-    for pert_name, pert_fn in PERTURBATIONS.items():
-        needs_coords = pert_name in NEEDS_COORDS
-        for level in levels:
-            per_metric_param_samples = {m: {} for m in ALL_METRICS}
-            for coords in sequences.values():
-                n = coords.shape[0]
-                for _ in range(n_repeats):
-                    perm = pert_fn(n, level, rng, coords=coords if needs_coords else None)
-                    if pert_name == "swap_nearby_locations" and level > 0 and np.array_equal(perm, np.arange(n)):
-                        continue
-                    vals = evaluate_pair(
-                        coords,
-                        perm,
-                        eps_values=eps_values,
-                        crqa_radius_values=crqa_radius_values,
-                        grid_sizes=grid_sizes,
-                        erp_gap_points=erp_gap_points,
-                    )
-                    for m in ALL_METRICS:
-                        for label, v in vals[m].items():
-                            if not (isinstance(v, float) and np.isnan(v)):
-                                per_metric_param_samples[m].setdefault(label, []).append(v)
-            for m in ALL_METRICS:
-                for label, samples in per_metric_param_samples[m].items():
-                    mean = float(np.mean(samples)) if samples else float("nan")
-                    std = float(np.std(samples)) if samples else float("nan")
-                    results[pert_name][m].setdefault(label, []).append([level, mean, std, len(samples)])
-    return results
+    `workers`: `<= 1` runs in-process (the original, single-core behavior -- no
+    `multiprocessing` overhead, simplest to debug). `> 1` spins up a `Pool` of that
+    many worker processes (see the module docstring for why `h5py` doesn't need to,
+    and can't, follow the data there) and hands out `chunk_size`-unit chunks, one
+    batch of `workers` chunks at a time: each batch is a single blocking `pool.map`
+    call, so `should_stop` is only checked between batches, never mid-chunk -- a
+    SIGTERM's worst-case extra work is one in-flight chunk per worker (tune
+    `chunk_size` down if that's more slack than the job's walltime margin allows).
+    Chunks are contiguous unit ranges processed and returned in submission order, so
+    the cursor this returns is still a single "everything before this is done"
+    integer, exactly like the serial path's.
+    """
+    accum = new_accumulator() if accum is None else accum
+    pert_items = list(PERTURBATIONS.items())
+    coords_list = list(sequences.values())
+    n_levels, n_samples = len(levels), len(coords_list)
+    units_total = len(pert_items) * n_levels * n_samples
+
+    if workers <= 1:
+        for unit in range(start_unit, units_total):
+            _evaluate_unit(
+                accum, unit, coords_list, pert_items, levels, seed, n_repeats,
+                eps_values, crqa_radius_values, grid_sizes, erp_gap_points,
+            )
+            if on_progress is not None:
+                on_progress(unit + 1, units_total)
+            if should_stop is not None and should_stop():
+                return accum, unit + 1
+        return accum, units_total
+
+    ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
+    initargs = (coords_list, levels, seed, n_repeats, eps_values, crqa_radius_values, grid_sizes, erp_gap_points)
+    cursor = start_unit
+    with ctx.Pool(processes=workers, initializer=_init_worker, initargs=initargs) as pool:
+        while cursor < units_total:
+            batch, pos = [], cursor
+            for _ in range(workers):
+                if pos >= units_total:
+                    break
+                stop = min(pos + chunk_size, units_total)
+                batch.append((pos, stop))
+                pos = stop
+
+            for chunk_start, chunk_stop, local_accum in pool.map(_process_chunk, batch):
+                merge_accumulators(accum, local_accum)
+                cursor = chunk_stop  # batch ranges are contiguous & returned in submission order
+            if on_progress is not None:
+                on_progress(cursor, units_total)
+            if should_stop is not None and should_stop():
+                return accum, cursor
+
+    return accum, cursor
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +628,21 @@ def plot_perturbation(pert_name, pert_results, out_dir):
     return out_path
 
 
+def _default_worker_count():
+    """Cores actually available to this process, not the machine's total -- on a
+    SLURM node, `os.cpu_count()` reports every core on the node regardless of
+    `--cpus-per-task`, while the sched-affinity mask reflects the cgroup/cpuset SLURM
+    actually confined this job to."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # sched_getaffinity is Linux-only
+        return os.cpu_count() or 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--h5-path", default=os.path.join(os.path.dirname(__file__), "..", "..", "reflacx_data.h5")
+        "--h5-path", default=os.path.join(os.path.dirname(__file__), "..", "reflacx_data.h5")
     )
     parser.add_argument("--split", default="TRAIN")
     parser.add_argument("--dataset-name", default="reflacx")
@@ -317,7 +670,35 @@ def main():
         "--output-dir",
         default=os.path.join(os.path.dirname(__file__), "..", "work_dir", "metric_damage_curves"),
     )
+    parser.add_argument("--max-samples", type=int, default=None, help="use only the first N scanpaths")
+    parser.add_argument(
+        "--checkpoint-every", type=float, default=300.0,
+        help="seconds between checkpoint/CSV flushes (a killed job loses at most this much work)",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="discard any existing checkpoint in --output-dir and start the sweep over",
+    )
+    parser.add_argument(
+        "--plot-only", action="store_true",
+        help="re-export CSV/JSON/figures from the existing checkpoint without evaluating anything",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="worker processes for the sweep (default 1 = single-process, original behavior). "
+        "0 or negative = use every core this job has (see os.sched_getaffinity), "
+        "i.e. what --cpus-per-task reserved on SLURM. See the module docstring for why this is "
+        "safe despite h5py not being multiprocessing-friendly.",
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=8,
+        help="work units per task handed to a worker process (--workers > 1 only); smaller = "
+        "finer-grained load balancing and a shorter SIGTERM grace period, larger = less "
+        "inter-process overhead",
+    )
     args = parser.parse_args()
+    if args.workers <= 0:
+        args.workers = _default_worker_count()
 
     if len(args.erp_gap_points) % 2 != 0:
         parser.error("--erp-gap-points must be a flat list of x,y pairs (even count)")
@@ -325,14 +706,85 @@ def main():
         (args.erp_gap_points[i], args.erp_gap_points[i + 1]) for i in range(0, len(args.erp_gap_points), 2)
     ]
 
+    # SLURM sends SIGTERM at the walltime (and SIGUSR1 first, if the job asked for an
+    # early warning via `--signal`); finish the work unit in flight, flush, and exit 0
+    # so the next submission of the same command resumes instead of redoing the sweep.
+    # Installed before the H5 load so a signal arriving during startup doesn't kill the
+    # process outright.
+    stop_requested = {"value": False}
+
+    def request_stop(signum, _frame):
+        stop_requested["value"] = True
+        print(f"\nreceived signal {signum} -- finishing current work unit, then checkpointing", flush=True)
+
+    for sig in (signal.SIGTERM, signal.SIGUSR1, signal.SIGINT):
+        signal.signal(sig, request_stop)
+
     os.makedirs(args.output_dir, exist_ok=True)
+    checkpoint_path = os.path.join(args.output_dir, "checkpoint.json")
+    csv_path = os.path.join(args.output_dir, "results.csv")
+    json_path = os.path.join(args.output_dir, "results.json")
+
     sequences = load_local_reflacx_sequences(
         args.h5_path, args.split, args.dataset_name, max_fixations=args.max_fixations
     )
-    lengths = {sid: xy.shape[0] for sid, xy in sequences.items()}
-    print(f"Loaded {len(sequences)} scanpaths from {args.h5_path}: lengths {lengths}")
+    if args.max_samples is not None:
+        sequences = dict(list(sequences.items())[: args.max_samples])
+    lengths = np.array([xy.shape[0] for xy in sequences.values()])
+    print(
+        f"Loaded {len(sequences)} scanpaths from {args.h5_path}: "
+        f"lengths min/mean/max = {lengths.min()}/{lengths.mean():.1f}/{lengths.max()}"
+    )
+    print(f"workers={args.workers}" + (f" chunk_size={args.chunk_size}" if args.workers > 1 else ""))
 
-    results = run_experiment(
+    fingerprint = _config_fingerprint(args, erp_gap_points, list(sequences))
+    units_total = len(PERTURBATIONS) * len(args.levels) * len(sequences)
+
+    if args.fresh and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    restored = None if args.fresh else load_checkpoint(checkpoint_path, fingerprint)
+    if restored is None:
+        cursor, accum, elapsed_before = 0, new_accumulator(), 0.0
+    else:
+        cursor, accum, elapsed_before = restored
+        print(f"Resuming from {checkpoint_path}: {cursor}/{units_total} work units already done")
+
+    def export(cursor_now, elapsed_now):
+        results = summarize(accum, args.levels)
+        save_checkpoint(checkpoint_path, fingerprint, cursor_now, units_total, accum, elapsed_now)
+        write_results_csv(csv_path, results)
+        _write_atomic(json_path, lambda f: json.dump(results, f, indent=2))
+        return results
+
+    if args.plot_only:
+        if restored is None:
+            raise SystemExit(f"--plot-only needs an existing checkpoint; none found at {checkpoint_path}")
+        results = export(cursor, elapsed_before)
+        for pert_name, pert_results in results.items():
+            print(f"wrote {plot_perturbation(pert_name, pert_results, args.output_dir)}")
+        return
+
+    started = time.time()
+    last_flush = started
+    units_done_at_start = cursor
+
+    def on_progress(units_done, total):
+        nonlocal last_flush
+        now = time.time()
+        if not stop_requested["value"] and (now - last_flush) < args.checkpoint_every:
+            return
+        last_flush = now
+        elapsed = elapsed_before + (now - started)
+        export(units_done, elapsed)
+        rate = (units_done - units_done_at_start) / max(now - started, 1e-9)
+        eta_hours = ((total - units_done) / rate) / 3600 if rate > 0 else float("inf")
+        print(
+            f"[{units_done}/{total} units, {100 * units_done / total:.1f}%] "
+            f"{rate * 3600:.0f} units/h, ETA {eta_hours:.1f} h -- checkpointed to {checkpoint_path}",
+            flush=True,
+        )
+
+    accum, cursor = run_sweep(
         sequences,
         args.levels,
         args.n_repeats,
@@ -341,14 +793,31 @@ def main():
         crqa_radius_values=args.crqa_radius_values,
         grid_sizes=args.grid_sizes,
         erp_gap_points=erp_gap_points,
+        accum=accum,
+        start_unit=cursor,
+        on_progress=on_progress,
+        should_stop=lambda: stop_requested["value"],
+        workers=args.workers,
+        chunk_size=args.chunk_size,
     )
 
-    with open(os.path.join(args.output_dir, "results.json"), "w") as f:
-        json.dump(results, f, indent=2)
+    elapsed = elapsed_before + (time.time() - started)
+    results = export(cursor, elapsed)
+    print(f"wrote {csv_path}\nwrote {json_path}")
+
+    if cursor < units_total:
+        print(
+            f"\nINCOMPLETE: {cursor}/{units_total} work units done ({100 * cursor / units_total:.1f}%), "
+            f"{elapsed / 3600:.2f} h of compute so far.\n"
+            f"{csv_path} holds the partial curves. Re-run the same command to resume; "
+            f"add --plot-only to draw the figures from what's done."
+        )
+        return
 
     for pert_name, pert_results in results.items():
         out_path = plot_perturbation(pert_name, pert_results, args.output_dir)
         print(f"wrote {out_path}")
+    print(f"\nDone: {units_total} work units in {elapsed / 3600:.2f} h.")
 
 
 if __name__ == "__main__":
