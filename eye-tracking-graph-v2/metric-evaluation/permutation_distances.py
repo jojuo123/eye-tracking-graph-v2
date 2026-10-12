@@ -10,6 +10,10 @@ one distance per row instead of a scalar.
     hamming_distance            -- positions where the two orderings disagree
     kendall_tau_distance        -- pairwise disagreements (== adjacent transpositions
                                     needed to sort one into the other)
+    windowed_kendall_tau_distance
+                                -- Kendall tau that ignores pairs closer than a
+                                    DTW-style (Sakoe-Chiba) warping window in the
+                                    reference ordering, so local reorderings are free
     spearman_footrule_distance  -- total absolute rank displacement, summed over items
     cayley_distance             -- minimum arbitrary transpositions to sort one into
                                     the other (== n minus the number of cycles in the
@@ -111,13 +115,14 @@ def _lis_length(pi):
 
 def _pairwise(distance_fn):
     """Wraps a single-pair (1D `a`, `b` -> scalar) distance so it also accepts a batch
-    of pairs (2D `a`, `b`, one permutation per row -> 1D array of per-row distances)."""
+    of pairs (2D `a`, `b`, one permutation per row -> 1D array of per-row distances).
+    Any extra arguments (e.g. `window`) are passed through unchanged to every pair."""
 
-    def wrapped(a, b):
+    def wrapped(a, b, *args, **kwargs):
         a, b = np.asarray(a), np.asarray(b)
         if a.ndim == 1:
-            return distance_fn(a, b)
-        return np.array([distance_fn(a[i], b[i]) for i in range(a.shape[0])])
+            return distance_fn(a, b, *args, **kwargs)
+        return np.array([distance_fn(a[i], b[i], *args, **kwargs) for i in range(a.shape[0])])
 
     return wrapped
 
@@ -148,6 +153,32 @@ def kendall_tau_distance(a, b):
     return _count_inversions(_relative_permutation(a, b).tolist())
 
 
+def windowed_kendall_max(n, window):
+    """Number of position pairs `i < j` of an `n`-item ordering with `j - i > window` --
+    the pairs `windowed_kendall_tau_distance` counts, and so its maximum (reached by
+    the full reversal, which disorders every pair)."""
+    window = max(int(window), 0)
+    if window >= n - 1:
+        return 0
+    k = n - 1 - window  # number of distinct separations d = window+1 .. n-1
+    return k * (k + 1) // 2  # sum_{d=window+1}^{n-1} (n - d)
+
+
+@_pairwise
+def windowed_kendall_tau_distance(a, b, window=0):
+    """Kendall tau distance restricted to item pairs that sit more than `window`
+    positions apart in `a` (the reference ordering, e.g. ground truth): a pair `(u, v)`
+    with `|pos_a(u) - pos_a(v)| <= window` is never counted, however `b` orders it.
+    This borrows DTW's Sakoe-Chiba band -- reorderings local enough to fit inside the
+    warping window are tolerated, the way DTW tolerates local time misalignment -- while
+    keeping Kendall's identity-based, pairwise view of order. `window=0` is plain
+    `kendall_tau_distance`. Range: `[0, windowed_kendall_max(n, window)]`."""
+    pi = _relative_permutation(a, b)  # pi[i] = position in b of the item at position i of a
+    n = len(pi)
+    i, j = np.triu_indices(n, k=max(int(window), 0) + 1)
+    return int(np.sum(pi[i] > pi[j]))
+
+
 @_pairwise
 def cayley_distance(a, b):
     """Minimum number of (not necessarily adjacent) transpositions needed to turn `a`
@@ -170,6 +201,7 @@ def ulam_distance(a, b):
 DISTANCES = {
     "hamming": hamming_distance,
     "kendall_tau": kendall_tau_distance,
+    "windowed_kendall_tau": windowed_kendall_tau_distance,
     "spearman_footrule": spearman_footrule_distance,
     "cayley": cayley_distance,
     "ulam": ulam_distance,
@@ -226,6 +258,7 @@ if __name__ == "__main__":
     checks = {
         "hamming": brute_hamming,
         "kendall_tau": brute_kendall_tau,
+        "windowed_kendall_tau": brute_kendall_tau,  # window=0 default == plain Kendall tau
         "spearman_footrule": brute_footrule,
         "cayley": brute_cayley,
         "ulam": brute_ulam,
@@ -240,6 +273,25 @@ if __name__ == "__main__":
             want = checks[name](a, b)
             assert got == want, f"{name}(trial {trial}, n={n}): got {got}, want {want} (a={a}, b={b})"
     print("All 200 random single-pair trials match brute-force reference implementations.")
+
+    def brute_windowed_kendall(a, b, window):
+        a, b = np.asarray(a).tolist(), np.asarray(b).tolist()
+        pos_b = {v: i for i, v in enumerate(b)}
+        return sum(
+            1
+            for i in range(len(a))
+            for j in range(i + window + 1, len(a))
+            if pos_b[a[i]] > pos_b[a[j]]
+        )
+
+    for trial in range(200):
+        n = int(rng.integers(1, 12))
+        window = int(rng.integers(0, n + 1))
+        a, b = rng.permutation(n), rng.permutation(n)
+        got, want = windowed_kendall_tau_distance(a, b, window), brute_windowed_kendall(a, b, window)
+        assert got == want, f"windowed_kendall(n={n}, w={window}): got {got}, want {want}"
+        assert windowed_kendall_tau_distance(a, a[::-1], window) == windowed_kendall_max(n, window)
+    print("All 200 windowed Kendall tau trials match brute force; reversal hits windowed_kendall_max.")
 
     a = np.array([0, 1, 2, 3, 4])
     b = np.array([4, 3, 2, 1, 0])
