@@ -1,13 +1,15 @@
 """Sensitivity analysis: for every synthetic damage type in `perturbations.py`, at a
-range of severity levels, damage real REFLACX scanpaths and measure how much every
-metric in `permutation_distances.py` / `scanpath_similarity.py` /
-`trajectory_distances.py` moves -- producing one figure per damage type, each a grid
-of small multiples (one subplot per metric family, since the families live on
-different scales) plotting metric value vs. severity level.
+range of severity levels, damage real REFLACX scanpaths and measure how much each
+shortlisted metric in `normalized_metrics.py` moves -- producing one figure per damage
+type, one subplot per metric family, plotting metric value vs. severity level. Every
+metric is a `[0, 1]` dissimilarity there (0 = identical order), so all subplots share
+one y-axis.
 
 This is purely a diagnostic/exploratory script (which metrics are sensitive to which
 kind of scanpath-order error, and which are blind to it) -- it doesn't change any of
-the three metric modules.
+the metric modules. `plot_damage_vs_model.py` overlays a trained model's scores (from
+`run_model_evaluation.py`) on these curves; `samples.json` records which scanpaths a
+run used, so the two can be checked to cover the same samples.
 
 Requires `h5py` and `matplotlib`, unlike the rest of this directory (which is
 numpy-only): both are optional extras for this one script, not full project
@@ -71,89 +73,31 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from normalized_metrics import ALL_METRICS, METRIC_GROUPS, evaluate_pair
 from perturbations import NEEDS_COORDS, PERTURBATIONS
-from permutation_distances import (
-    cayley_distance,
-    hamming_distance,
-    kendall_tau_distance,
-    spearman_footrule_distance,
-    ulam_distance,
-)
-from scanpath_similarity import cross_recurrence_analysis, multimatch, scanmatch, string_edit_distance
-from trajectory_distances import (
-    discrete_frechet_distance,
-    dynamic_time_warping,
-    edr_distance,
-    erp_distance,
-    hausdorff_distance,
-    lcss_distance,
-)
 
 # ---------------------------------------------------------------------------
-# Metric families -- grouped by scale, since a single axis can't honestly show a
-# [0, 1]-bounded score next to a raw spatial distance (see dataviz "one axis" rule).
+# Metric families come from `normalized_metrics.py` (shared with
+# `run_model_evaluation.py`): every metric there is a [0, 1] dissimilarity -- 0 for
+# identical order, 1 for the metric's worst possible value -- so one axis, one
+# reading direction and one range hold for all of them.
 # ---------------------------------------------------------------------------
 
-PERM_METRICS = ["hamming", "kendall_tau", "spearman_footrule", "cayley", "ulam"]
-EDIT_METRICS = ["string_edit_distance", "scanmatch", "edr"]
-MULTIMATCH_DIMS = ["vector", "length", "direction", "position", "multimatch"]
-CRQA_METRICS = ["rec", "det", "lam", "corm"]
-TRAJ_BOUNDED = ["dtw", "lcss"]
-TRAJ_SPATIAL = ["discrete_frechet", "hausdorff", "erp"]
-
-METRIC_GROUPS = [
-    ("Permutation distances (fraction of max)", PERM_METRICS),
-    ("Edit-based", EDIT_METRICS),
-    ("MultiMatch dimensions (similarity)", MULTIMATCH_DIMS),
-    ("Cross-recurrence analysis (%)", CRQA_METRICS),
-    ("Trajectory distances, length-normalized", TRAJ_BOUNDED),
-    ("Trajectory distances, spatial units", TRAJ_SPATIAL),
-]
-ALL_METRICS = [m for _, group in METRIC_GROUPS for m in group]
 METRIC_GROUP_OF = {m: title for title, group in METRIC_GROUPS for m in group}
 
-# Which way is "better" (= damaged scanpath closer to the original), read off each
-# metric's definition: distances are 0 for identical scanpaths, similarities are max.
-# `lam` isn't a similarity score by construction (it measures dwell/revisit
-# asymmetry), but damage only ever lowers it here, so it's tagged "higher" too. `corm`
-# is signed (lag vs. lead), so better means closer to 0, not higher or lower.
+# Which way is "better" (= damaged scanpath closer to the original). Kept as a table
+# the plotting reads, so a future metric that isn't a dissimilarity can be added
+# without touching the plot code.
 HIGHER, LOWER, ZERO = "higher", "lower", "zero"
-METRIC_DIRECTION = {
-    **{m: LOWER for m in PERM_METRICS},
-    "string_edit_distance": LOWER,
-    "scanmatch": HIGHER,
-    "edr": LOWER,
-    **{m: HIGHER for m in MULTIMATCH_DIMS},
-    "rec": HIGHER,
-    "det": HIGHER,
-    "lam": HIGHER,
-    "corm": ZERO,
-    **{m: LOWER for m in TRAJ_BOUNDED + TRAJ_SPATIAL},
-}
+METRIC_DIRECTION = {m: LOWER for m in ALL_METRICS}
 DIRECTION_ARROW = {HIGHER: "\u2191", LOWER: "\u2193", ZERO: "\u21920"}
 DIRECTION_TEXT = {HIGHER: "higher is better", LOWER: "lower is better", ZERO: "closer to 0 is better"}
 
-# Theoretical range of each plotted value (after the normalization in
-# `evaluate_pair`), for fixation coordinates normalized to the unit square -- which is
-# why the spatial ones top out at sqrt(2), the square's diagonal. dtw is divided by
-# its warping-path length, i.e. it's an average per-step distance, so it's bounded by
-# sqrt(2) too, not by 1.
-SQRT2 = "\u221a2"
-METRIC_RANGE = {
-    **{m: "[0, 1]" for m in PERM_METRICS + EDIT_METRICS + MULTIMATCH_DIMS},
-    "rec": "[0, 100]",
-    "det": "[0, 100]",
-    "lam": "[0, 100]",
-    "corm": "[\u2212100, 100]",
-    "dtw": f"[0, {SQRT2}]",
-    "lcss": "[0, 1]",
-    **{m: f"[0, {SQRT2}]" for m in TRAJ_SPATIAL},
-}
+# Theoretical range of each plotted value, after `normalized_metrics`'s normalization.
+METRIC_RANGE = {m: "[0, 1]" for m in ALL_METRICS}
 
-# Still evaluated and exported to CSV/JSON, just not drawn: hausdorff compares the two
-# scanpaths as unordered point sets, and every damage type here only reorders the
-# same fixations, so it's identically 0 and says nothing about order errors.
-PLOT_EXCLUDE = {"hausdorff"}
+# Still evaluated and exported to CSV/JSON, just not drawn.
+PLOT_EXCLUDE = set()
 
 
 def _range_hint(metric_names):
@@ -170,114 +114,54 @@ def _range_hint(metric_names):
 # Spelled-out names for the abbreviated metric/parameter labels, printed as a note
 # under the panel that uses them (the legends are too crowded to expand in place).
 GROUP_GLOSSARY = {
-    "Edit-based": [
+    "Order-based (permutation)": [
+        "windowed_kendall_tau: pairs within w\u00b7n GT positions are ignored",
+        "(a DTW-style warping window; w=0 is plain Kendall tau)",
+    ],
+    "Trajectory / alignment": [
+        "dtw = dynamic time warping, lcss = longest common subsequence",
         "edr = edit distance on real sequences",
+        "eps = max distance for two fixations to match",
         "grid = n\u00d7n grid of AOIs (areas of interest)",
-        "eps = max distance for two fixations to match",
     ],
-    "Cross-recurrence analysis (%)": [
-        "rec = recurrence rate",
-        "det = determinism",
-        "lam = laminarity",
-        "corm = center of recurrence mass",
-        "radius = max distance for two fixations to count as recurrent",
-    ],
-    "Trajectory distances, length-normalized": [
-        "dtw = dynamic time warping",
-        "lcss = longest common subsequence",
-        "eps = max distance for two fixations to match",
-    ],
-    "Trajectory distances, spatial units": [
-        "discrete_frechet = discrete Fr\u00e9chet distance",
-        "erp = edit distance with real penalty",
-        "gap = reference point that unmatched fixations are compared to",
+    "MultiMatch (1 - similarity)": [
+        "mm_* = 1 \u2212 each MultiMatch dimension, multimatch = 1 \u2212 their mean",
     ],
 }
 
 
-def evaluate_pair(
-    coords,
-    perm,
-    eps_values=(0.05,),
-    crqa_radius_values=(0.05,),
-    grid_sizes=(5,),
-    erp_gap_points=((0.0, 0.0),),
-):
-    """`coords`: `(n, 2)` original scanpath. `perm`: a permutation of `0..n-1` (see
-    `perturbations.py`) -- the damaged scanpath is `coords[perm]`. Returns
-    `{metric_name: {param_label: value}}` covering every metric in `ALL_METRICS`:
-    metrics with no free parameter get a single `"default"` entry; metrics that take
-    one (`lcss`/`edr`'s `eps`, the CRQA family's `radius`, `string_edit_distance`/
-    `scanmatch`'s AOI `grid_shape`, `erp`'s `gap_point`) get one entry per value in
-    the corresponding `*_values`/`grid_sizes`/`erp_gap_points` argument, so callers
-    can see both severity-sensitivity and parameter-sensitivity at once. Count-based
-    permutation distances are normalized by their maximum possible value (so they're
-    comparable across scanpaths of different length); `dtw`/`string_edit_distance`/
-    `edr` use those functions' own `normalize=True`; `erp` is divided by `n` (average
-    per-point cost) to bring it onto roughly the same scale as `discrete_frechet`/
-    `hausdorff` (otherwise it grows with `n` even for a fixed *fraction* of the path
-    disturbed, since more points means more accumulated edit cost)."""
-    n = coords.shape[0]
-    identity = np.arange(n)
-    damaged = coords[perm]
-
-    max_kendall = n * (n - 1) / 2
-    max_footrule = (n * n) // 2
-
-    values = {
-        "hamming": {"default": hamming_distance(identity, perm) / n},
-        "kendall_tau": {
-            "default": (kendall_tau_distance(identity, perm) / max_kendall) if max_kendall > 0 else 0.0
-        },
-        "spearman_footrule": {
-            "default": (spearman_footrule_distance(identity, perm) / max_footrule) if max_footrule > 0 else 0.0
-        },
-        "cayley": {"default": (cayley_distance(identity, perm) / (n - 1)) if n > 1 else 0.0},
-        "ulam": {"default": (ulam_distance(identity, perm) / (n - 1)) if n > 1 else 0.0},
-        "dtw": {"default": dynamic_time_warping(coords, damaged, normalize=True)},
-        "discrete_frechet": {"default": discrete_frechet_distance(coords, damaged)},
-        "hausdorff": {"default": hausdorff_distance(coords, damaged)},
-    }
-
-    values["string_edit_distance"] = {
-        f"grid={g}x{g}": string_edit_distance(coords, damaged, grid_shape=(g, g), normalize=True)
-        for g in grid_sizes
-    }
-    values["scanmatch"] = {f"grid={g}x{g}": scanmatch(coords, damaged, grid_shape=(g, g)) for g in grid_sizes}
-    values["edr"] = {f"eps={eps:g}": edr_distance(coords, damaged, eps=eps, normalize=True) for eps in eps_values}
-    values["lcss"] = {f"eps={eps:g}": lcss_distance(coords, damaged, eps=eps) for eps in eps_values}
-    values["erp"] = {
-        f"gap=({gp[0]:g},{gp[1]:g})": (erp_distance(coords, damaged, gap_point=gp) / n if n > 0 else 0.0)
-        for gp in erp_gap_points
-    }
-
-    mm = multimatch(coords, damaged)
-    for dim in MULTIMATCH_DIMS:
-        values[dim] = {"default": mm[dim] if mm[dim] is not None else float("nan")}
-
-    for radius in crqa_radius_values:
-        crqa = cross_recurrence_analysis(coords, damaged, radius=radius)
-        label = f"radius={radius:g}"
-        for key in CRQA_METRICS:
-            values.setdefault(key, {})[label] = crqa[key] if crqa[key] is not None else float("nan")
-
-    return values
-
-
 def load_local_reflacx_sequences(
-    h5_path, split="TRAIN", dataset_name="reflacx", x_col="x_position_norm", y_col="y_position_norm", max_fixations=100
+    h5_path,
+    split="TRAIN",
+    dataset_name="reflacx",
+    x_col="x_position_norm",
+    y_col="y_position_norm",
+    max_fixations=100,
+    max_samples=None,
+    seed=0,
+    coord_scale=1.0,
 ):
     """Loads every sample's fixation `(x, y)` sequence from the REFLACX H5 file (same
     layout/columns `visualize_fixation_order_heatmap.py` reads), normalized `[0, 1]`.
     `max_fixations`: sequences longer than this are truncated to their first
     `max_fixations` fixations, to bound the runtime of this script's O(n^2)-ish
-    metrics (several samples run into the hundreds of fixations)."""
+    metrics (several samples run into the hundreds of fixations); `None` keeps every
+    fixation. `max_samples`: if set, loads only a `seed`-fixed random subset of that
+    many samples -- drawn exactly as `run_model_evaluation.iter_samples` draws it, so
+    the same `--max-samples`/seed in both scripts selects the same scanpaths.
+    `coord_scale`: coordinates are divided by this before clipping, for H5 files that
+    store `*_norm` columns pre-multiplied (e.g. 20 for `normalized_data_softGT_scaled20.h5`)
+    -- the metrics' bounds and `eps`/grid defaults all assume `[0, 1]`."""
     sequences = {}
     with h5py.File(h5_path, "r") as f:
         group = f[split][dataset_name]
-        for sample_id in sorted(group.keys()):
+        sample_ids = sorted(group.keys())
+        if max_samples is not None and len(sample_ids) > max_samples:
+            rng = np.random.default_rng(seed)
+            sample_ids = sorted(rng.choice(sample_ids, size=max_samples, replace=False).tolist())
+        for sample_id in sample_ids:
             fx = group[sample_id]["fixations"]
-            xy = np.stack([fx[x_col][()], fx[y_col][()]], axis=-1).astype(np.float64)
+            xy = np.stack([fx[x_col][()], fx[y_col][()]], axis=-1).astype(np.float64) / coord_scale
             xy = np.clip(xy, 0.0, 1.0)
             if max_fixations is not None and xy.shape[0] > max_fixations:
                 xy = xy[:max_fixations]
@@ -359,7 +243,7 @@ def summarize(accum, levels):
     return results
 
 
-def _config_fingerprint(args, erp_gap_points, sample_ids):
+def _config_fingerprint(args, sample_ids):
     """Identifies the sweep a checkpoint belongs to: resuming into a *different*
     sweep would silently pool incomparable draws, so the parameters, the sample list
     and the metric set all feed the hash."""
@@ -369,10 +253,10 @@ def _config_fingerprint(args, erp_gap_points, sample_ids):
             "levels": list(args.levels),
             "n_repeats": args.n_repeats,
             "seed": args.seed,
+            "window_fracs": list(args.window_fracs),
             "eps_values": list(args.eps_values),
-            "crqa_radius_values": list(args.crqa_radius_values),
             "grid_sizes": list(args.grid_sizes),
-            "erp_gap_points": [list(p) for p in erp_gap_points],
+            "coord_scale": args.coord_scale,
             "split": args.split,
             "dataset_name": args.dataset_name,
             "max_fixations": args.max_fixations,
@@ -471,7 +355,7 @@ def merge_accumulators(dst, src):
 
 def _evaluate_unit(
     accum, unit, coords_list, pert_items, levels, seed, n_repeats,
-    eps_values, crqa_radius_values, grid_sizes, erp_gap_points,
+    window_fracs, eps_values, grid_sizes,
 ):
     """Runs one (sample, damage type, severity level) work unit -- `n_repeats` damage
     draws, each evaluated against every metric -- and folds the results into `accum`.
@@ -493,12 +377,7 @@ def _evaluate_unit(
         if pert_name == "swap_nearby_locations" and level > 0 and np.array_equal(perm, np.arange(n)):
             continue
         vals = evaluate_pair(
-            coords,
-            perm,
-            eps_values=eps_values,
-            crqa_radius_values=crqa_radius_values,
-            grid_sizes=grid_sizes,
-            erp_gap_points=erp_gap_points,
+            coords, perm, window_fracs=window_fracs, eps_values=eps_values, grid_sizes=grid_sizes
         )
         accumulate(accum, pert_name, level_index, vals)
 
@@ -516,7 +395,7 @@ def _evaluate_unit(
 _worker_state = {}
 
 
-def _init_worker(coords_list, levels, seed, n_repeats, eps_values, crqa_radius_values, grid_sizes, erp_gap_points):
+def _init_worker(coords_list, levels, seed, n_repeats, window_fracs, eps_values, grid_sizes):
     # SLURM (and an interactive Ctrl-C) delivers SIGTERM/SIGUSR1 to the whole process
     # group, i.e. to workers too, not just the main process. Workers ignore them: the
     # main process's own handler is what decides when to stop (see `main`), by simply
@@ -530,10 +409,9 @@ def _init_worker(coords_list, levels, seed, n_repeats, eps_values, crqa_radius_v
         levels=levels,
         seed=seed,
         n_repeats=n_repeats,
+        window_fracs=window_fracs,
         eps_values=eps_values,
-        crqa_radius_values=crqa_radius_values,
         grid_sizes=grid_sizes,
-        erp_gap_points=erp_gap_points,
     )
 
 
@@ -547,7 +425,7 @@ def _process_chunk(unit_range):
     for unit in range(start, stop):
         _evaluate_unit(
             local_accum, unit, st["coords_list"], st["pert_items"], st["levels"], st["seed"], st["n_repeats"],
-            st["eps_values"], st["crqa_radius_values"], st["grid_sizes"], st["erp_gap_points"],
+            st["window_fracs"], st["eps_values"], st["grid_sizes"],
         )
     return start, stop, local_accum
 
@@ -557,10 +435,9 @@ def run_sweep(
     levels,
     n_repeats,
     seed=0,
+    window_fracs=(0.1,),
     eps_values=(0.05,),
-    crqa_radius_values=(0.05,),
     grid_sizes=(5,),
-    erp_gap_points=((0.0, 0.0),),
     accum=None,
     start_unit=0,
     on_progress=None,
@@ -574,7 +451,7 @@ def run_sweep(
     given level is a noisy draw, e.g. which adjacent pairs `local_swaps` happens to
     pick; several repeats per sample, pooled with all other samples, is what turns
     that into a stable curve) and evaluates every metric -- at every swept parameter
-    value, for metrics that take one (see `evaluate_pair`) -- comparing each damaged
+    value, for metrics that take one (see `normalized_metrics.evaluate_pair`) -- comparing each damaged
     scanpath back to its own original.
 
     Folds each draw into `accum`'s running totals (see `new_accumulator`) and
@@ -613,7 +490,7 @@ def run_sweep(
         for unit in range(start_unit, units_total):
             _evaluate_unit(
                 accum, unit, coords_list, pert_items, levels, seed, n_repeats,
-                eps_values, crqa_radius_values, grid_sizes, erp_gap_points,
+                window_fracs, eps_values, grid_sizes,
             )
             if on_progress is not None:
                 on_progress(unit + 1, units_total)
@@ -622,7 +499,7 @@ def run_sweep(
         return accum, units_total
 
     ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
-    initargs = (coords_list, levels, seed, n_repeats, eps_values, crqa_radius_values, grid_sizes, erp_gap_points)
+    initargs = (coords_list, levels, seed, n_repeats, window_fracs, eps_values, grid_sizes)
     cursor = start_unit
     with ctx.Pool(processes=workers, initializer=_init_worker, initargs=initargs) as pool:
         while cursor < units_total:
@@ -675,7 +552,7 @@ def _style_axes(ax):
 
 
 def plot_perturbation(pert_name, pert_results, out_dir):
-    fig, axes = plt.subplots(2, 3, figsize=(19, 10.5))
+    fig, axes = plt.subplots(1, len(METRIC_GROUPS), figsize=(19, 6.2), sharey=True, squeeze=False)
     fig.patch.set_facecolor(PAGE)
     for ax, (group_title, metric_names) in zip(axes.ravel(), METRIC_GROUPS):
         _style_axes(ax)
@@ -711,6 +588,8 @@ def plot_perturbation(pert_name, pert_results, out_dir):
             ha="left", va="bottom", style="italic",
         )
         ax.set_xlabel("severity level", fontsize=8, color=TEXT_SECONDARY)
+        if ax is axes.ravel()[0]:
+            ax.set_ylabel("dissimilarity (0 = identical order)", fontsize=8, color=TEXT_SECONDARY)
         glossary = GROUP_GLOSSARY.get(group_title)
         if glossary:
             ax.text(
@@ -718,6 +597,7 @@ def plot_perturbation(pert_name, pert_results, out_dir):
                 color=TEXT_MUTED, ha="left", va="top", linespacing=1.4,
             )
         ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.02)
         ax.legend(
             fontsize=6, frameon=False, labelcolor=TEXT_SECONDARY,
             loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0,
@@ -726,11 +606,16 @@ def plot_perturbation(pert_name, pert_results, out_dir):
     fig.text(
         0.01, 0.955,
         "Each value compares a damaged scanpath to its original. "
-        + "   ".join(f"{DIRECTION_ARROW[d]} = {DIRECTION_TEXT[d]}" for d in (HIGHER, LOWER, ZERO))
-        + f".   Ranges assume fixation coordinates normalized to [0, 1] ({SQRT2} = diagonal of that square).",
+        + "   ".join(
+            f"{DIRECTION_ARROW[d]} = {DIRECTION_TEXT[d]}"
+            for d in (HIGHER, LOWER, ZERO)
+            if d in set(METRIC_DIRECTION.values())
+        )
+        + ".   Every metric is normalized to [0, 1] (see normalized_metrics.py), "
+        "on coordinates rescaled to [0, 1] (--coord-scale).",
         fontsize=8.5, color=TEXT_SECONDARY, ha="left", va="top",
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.94), h_pad=4.0)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     out_path = os.path.join(out_dir, f"{pert_name}.png")
     fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
@@ -755,12 +640,18 @@ def main():
     )
     parser.add_argument("--split", default="TRAIN")
     parser.add_argument("--dataset-name", default="reflacx")
-    parser.add_argument("--max-fixations", type=int, default=100)
+    parser.add_argument(
+        "--max-fixations", type=int, default=100, help="truncate longer sequences to this many (0 = no truncation)"
+    )
+    parser.add_argument(
+        "--coord-scale", type=float, default=1.0,
+        help="divide stored coordinates by this to get [0, 1] (20 for *_scaled20.h5 files)",
+    )
     parser.add_argument("--levels", type=float, nargs="+", default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     parser.add_argument("--n-repeats", type=int, default=5, help="random damage realizations per sample per level")
     parser.add_argument(
-        "--crqa-radius-values", type=float, nargs="+", default=[0.03, 0.05, 0.08],
-        help="cross_recurrence_analysis's `radius`, swept independently of severity",
+        "--window-fracs", type=float, nargs="+", default=[0.0, 0.05, 0.1, 0.2],
+        help="windowed_kendall_tau's warping window, as a fraction of n (0 = plain Kendall tau)",
     )
     parser.add_argument(
         "--eps-values", type=float, nargs="+", default=[0.025, 0.05, 0.1],
@@ -768,18 +659,17 @@ def main():
     )
     parser.add_argument(
         "--grid-sizes", type=int, nargs="+", default=[3, 5, 8],
-        help="string_edit_distance/scanmatch's AOI grid resolution (n -> an n x n grid)",
-    )
-    parser.add_argument(
-        "--erp-gap-points", type=float, nargs="+", default=[0.0, 0.0, 0.5, 0.5],
-        help="erp's reference gap point(s), as flat x,y pairs, e.g. `0 0 0.5 0.5` for two points",
+        help="scanmatch's AOI grid resolution (n -> an n x n grid)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--output-dir",
         default=os.path.join(os.path.dirname(__file__), "..", "work_dir", "metric_damage_curves"),
     )
-    parser.add_argument("--max-samples", type=int, default=None, help="use only the first N scanpaths")
+    parser.add_argument(
+        "--max-samples", type=int, default=None,
+        help="use a --seed-fixed random subset of N scanpaths (same draw as run_model_evaluation.py)",
+    )
     parser.add_argument(
         "--checkpoint-every", type=float, default=300.0,
         help="seconds between checkpoint/CSV flushes (a killed job loses at most this much work)",
@@ -821,12 +711,6 @@ def main():
     if args.workers <= 0:
         args.workers = _default_worker_count()
 
-    if len(args.erp_gap_points) % 2 != 0:
-        parser.error("--erp-gap-points must be a flat list of x,y pairs (even count)")
-    erp_gap_points = [
-        (args.erp_gap_points[i], args.erp_gap_points[i + 1]) for i in range(0, len(args.erp_gap_points), 2)
-    ]
-
     # SLURM sends SIGTERM at the walltime (and SIGUSR1 first, if the job asked for an
     # early warning via `--signal`); finish the work unit in flight, flush, and exit 0
     # so the next submission of the same command resumes instead of redoing the sweep.
@@ -847,10 +731,16 @@ def main():
     json_path = os.path.join(args.output_dir, "results.json")
 
     sequences = load_local_reflacx_sequences(
-        args.h5_path, args.split, args.dataset_name, max_fixations=args.max_fixations
+        args.h5_path, args.split, args.dataset_name, max_fixations=args.max_fixations or None,
+        max_samples=args.max_samples, seed=args.seed, coord_scale=args.coord_scale,
     )
-    if args.max_samples is not None:
-        sequences = dict(list(sequences.items())[: args.max_samples])
+    _write_atomic(
+        os.path.join(args.output_dir, "samples.json"),
+        lambda f: json.dump(
+            {"h5_path": args.h5_path, "split": args.split, "max_fixations": args.max_fixations,
+             "coord_scale": args.coord_scale, "sample_ids": list(sequences)}, f, indent=2,
+        ),
+    )
     lengths = np.array([xy.shape[0] for xy in sequences.values()])
     print(
         f"Loaded {len(sequences)} scanpaths from {args.h5_path}: "
@@ -858,7 +748,7 @@ def main():
     )
     print(f"workers={args.workers}" + (f" chunk_size={args.chunk_size}" if args.workers > 1 else ""))
 
-    fingerprint = _config_fingerprint(args, erp_gap_points, list(sequences))
+    fingerprint = _config_fingerprint(args, list(sequences))
     units_total = len(PERTURBATIONS) * len(args.levels) * len(sequences)
 
     if args.fresh and os.path.exists(checkpoint_path):
@@ -910,10 +800,9 @@ def main():
         args.levels,
         args.n_repeats,
         seed=args.seed,
+        window_fracs=args.window_fracs,
         eps_values=args.eps_values,
-        crqa_radius_values=args.crqa_radius_values,
         grid_sizes=args.grid_sizes,
-        erp_gap_points=erp_gap_points,
         accum=accum,
         start_unit=cursor,
         on_progress=on_progress,
