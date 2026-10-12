@@ -103,14 +103,96 @@ TRAJ_SPATIAL = ["discrete_frechet", "hausdorff", "erp"]
 
 METRIC_GROUPS = [
     ("Permutation distances (fraction of max)", PERM_METRICS),
-    ("Edit-based similarity (0-1)", EDIT_METRICS),
-    ("MultiMatch dimensions (similarity, 0-1)", MULTIMATCH_DIMS),
+    ("Edit-based", EDIT_METRICS),
+    ("MultiMatch dimensions (similarity)", MULTIMATCH_DIMS),
     ("Cross-recurrence analysis (%)", CRQA_METRICS),
-    ("Trajectory distances, bounded (0-1)", TRAJ_BOUNDED),
+    ("Trajectory distances, length-normalized", TRAJ_BOUNDED),
     ("Trajectory distances, spatial units", TRAJ_SPATIAL),
 ]
 ALL_METRICS = [m for _, group in METRIC_GROUPS for m in group]
 METRIC_GROUP_OF = {m: title for title, group in METRIC_GROUPS for m in group}
+
+# Which way is "better" (= damaged scanpath closer to the original), read off each
+# metric's definition: distances are 0 for identical scanpaths, similarities are max.
+# `lam` isn't a similarity score by construction (it measures dwell/revisit
+# asymmetry), but damage only ever lowers it here, so it's tagged "higher" too. `corm`
+# is signed (lag vs. lead), so better means closer to 0, not higher or lower.
+HIGHER, LOWER, ZERO = "higher", "lower", "zero"
+METRIC_DIRECTION = {
+    **{m: LOWER for m in PERM_METRICS},
+    "string_edit_distance": LOWER,
+    "scanmatch": HIGHER,
+    "edr": LOWER,
+    **{m: HIGHER for m in MULTIMATCH_DIMS},
+    "rec": HIGHER,
+    "det": HIGHER,
+    "lam": HIGHER,
+    "corm": ZERO,
+    **{m: LOWER for m in TRAJ_BOUNDED + TRAJ_SPATIAL},
+}
+DIRECTION_ARROW = {HIGHER: "\u2191", LOWER: "\u2193", ZERO: "\u21920"}
+DIRECTION_TEXT = {HIGHER: "higher is better", LOWER: "lower is better", ZERO: "closer to 0 is better"}
+
+# Theoretical range of each plotted value (after the normalization in
+# `evaluate_pair`), for fixation coordinates normalized to the unit square -- which is
+# why the spatial ones top out at sqrt(2), the square's diagonal. dtw is divided by
+# its warping-path length, i.e. it's an average per-step distance, so it's bounded by
+# sqrt(2) too, not by 1.
+SQRT2 = "\u221a2"
+METRIC_RANGE = {
+    **{m: "[0, 1]" for m in PERM_METRICS + EDIT_METRICS + MULTIMATCH_DIMS},
+    "rec": "[0, 100]",
+    "det": "[0, 100]",
+    "lam": "[0, 100]",
+    "corm": "[\u2212100, 100]",
+    "dtw": f"[0, {SQRT2}]",
+    "lcss": "[0, 1]",
+    **{m: f"[0, {SQRT2}]" for m in TRAJ_SPATIAL},
+}
+
+# Still evaluated and exported to CSV/JSON, just not drawn: hausdorff compares the two
+# scanpaths as unordered point sets, and every damage type here only reorders the
+# same fixations, so it's identically 0 and says nothing about order errors.
+PLOT_EXCLUDE = {"hausdorff"}
+
+
+def _range_hint(metric_names):
+    """"range [0, 1]" if the whole panel shares one range, else one "names: range"
+    clause per distinct range, in first-appearance order."""
+    by_range = {}
+    for m in metric_names:
+        by_range.setdefault(METRIC_RANGE[m], []).append(m)
+    if len(by_range) == 1:
+        return f"range {next(iter(by_range))}"
+    return "range " + ", ".join(f"{'/'.join(ms)} {r}" for r, ms in by_range.items())
+
+
+# Spelled-out names for the abbreviated metric/parameter labels, printed as a note
+# under the panel that uses them (the legends are too crowded to expand in place).
+GROUP_GLOSSARY = {
+    "Edit-based": [
+        "edr = edit distance on real sequences",
+        "grid = n\u00d7n grid of AOIs (areas of interest)",
+        "eps = max distance for two fixations to match",
+    ],
+    "Cross-recurrence analysis (%)": [
+        "rec = recurrence rate",
+        "det = determinism",
+        "lam = laminarity",
+        "corm = center of recurrence mass",
+        "radius = max distance for two fixations to count as recurrent",
+    ],
+    "Trajectory distances, length-normalized": [
+        "dtw = dynamic time warping",
+        "lcss = longest common subsequence",
+        "eps = max distance for two fixations to match",
+    ],
+    "Trajectory distances, spatial units": [
+        "discrete_frechet = discrete Fr\u00e9chet distance",
+        "erp = edit distance with real penalty",
+        "gap = reference point that unmatched fixations are compared to",
+    ],
+}
 
 
 def evaluate_pair(
@@ -593,10 +675,11 @@ def _style_axes(ax):
 
 
 def plot_perturbation(pert_name, pert_results, out_dir):
-    fig, axes = plt.subplots(2, 3, figsize=(19, 9))
+    fig, axes = plt.subplots(2, 3, figsize=(19, 10.5))
     fig.patch.set_facecolor(PAGE)
     for ax, (group_title, metric_names) in zip(axes.ravel(), METRIC_GROUPS):
         _style_axes(ax)
+        metric_names = [m for m in metric_names if m not in PLOT_EXCLUDE]
         for color, metric in zip(PALETTE, metric_names):
             param_series = pert_results[metric]  # {param_label: [(level, mean, std, n), ...]}
             single_default = list(param_series.keys()) == ["default"]
@@ -605,7 +688,9 @@ def plot_perturbation(pert_name, pert_results, out_dir):
                 ys = [row[1] for row in series]
                 stds = [row[2] for row in series]
                 linestyle = LINESTYLES[i % len(LINESTYLES)]
-                legend_label = metric if single_default else f"{metric} ({label})"
+                legend_label = f"{DIRECTION_ARROW[METRIC_DIRECTION[metric]]} {metric}"
+                if not single_default:
+                    legend_label += f" ({label})"
                 ax.plot(
                     xs, ys, color=color, linewidth=1.6, marker="o", markersize=3.5,
                     linestyle=linestyle, label=legend_label,
@@ -613,15 +698,39 @@ def plot_perturbation(pert_name, pert_results, out_dir):
                 lo = [y - s for y, s in zip(ys, stds)]
                 hi = [y + s for y, s in zip(ys, stds)]
                 ax.fill_between(xs, lo, hi, color=color, alpha=0.10, linewidth=0)
-        ax.set_title(group_title, fontsize=9.5, color=TEXT_PRIMARY, loc="left")
+        directions = {METRIC_DIRECTION[m] for m in metric_names}
+        if len(directions) == 1:
+            (d,) = directions
+            hint = f"{DIRECTION_ARROW[d]} {DIRECTION_TEXT[d]}"
+        else:
+            hint = "mixed direction: see arrows in legend"
+        hint += "   \u00b7   " + _range_hint(metric_names)
+        ax.set_title(group_title, fontsize=9.5, color=TEXT_PRIMARY, loc="left", pad=16)
+        ax.text(
+            0.0, 1.02, hint, transform=ax.transAxes, fontsize=7.5, color=TEXT_SECONDARY,
+            ha="left", va="bottom", style="italic",
+        )
         ax.set_xlabel("severity level", fontsize=8, color=TEXT_SECONDARY)
+        glossary = GROUP_GLOSSARY.get(group_title)
+        if glossary:
+            ax.text(
+                0.0, -0.16, "\n".join(glossary), transform=ax.transAxes, fontsize=7,
+                color=TEXT_MUTED, ha="left", va="top", linespacing=1.4,
+            )
         ax.set_xlim(-0.02, 1.02)
         ax.legend(
             fontsize=6, frameon=False, labelcolor=TEXT_SECONDARY,
             loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0,
         )
     fig.suptitle(f"Damage type: {pert_name}", fontsize=13, color=TEXT_PRIMARY, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.text(
+        0.01, 0.955,
+        "Each value compares a damaged scanpath to its original. "
+        + "   ".join(f"{DIRECTION_ARROW[d]} = {DIRECTION_TEXT[d]}" for d in (HIGHER, LOWER, ZERO))
+        + f".   Ranges assume fixation coordinates normalized to [0, 1] ({SQRT2} = diagonal of that square).",
+        fontsize=8.5, color=TEXT_SECONDARY, ha="left", va="top",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94), h_pad=4.0)
     out_path = os.path.join(out_dir, f"{pert_name}.png")
     fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
@@ -696,7 +805,19 @@ def main():
         "finer-grained load balancing and a shorter SIGTERM grace period, larger = less "
         "inter-process overhead",
     )
+    parser.add_argument(
+        "--from-results", metavar="RESULTS_JSON", default=None,
+        help="redraw the figures from an existing results.json (written next to it) and exit; "
+        "unlike --plot-only, this needs neither the H5 file nor the original run's arguments",
+    )
     args = parser.parse_args()
+    if args.from_results is not None:
+        with open(args.from_results) as f:
+            results = json.load(f)
+        out_dir = os.path.dirname(os.path.abspath(args.from_results))
+        for pert_name, pert_results in results.items():
+            print(f"wrote {plot_perturbation(pert_name, pert_results, out_dir)}")
+        return
     if args.workers <= 0:
         args.workers = _default_worker_count()
 
