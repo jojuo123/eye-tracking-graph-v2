@@ -31,6 +31,7 @@ numpy-only metric modules in this directory.
 import argparse
 import csv
 import json
+import multiprocessing as mp
 import os
 import sys
 import zlib
@@ -59,6 +60,7 @@ from run_damage_evaluation import (  # noqa: E402
     PALETTE,
     TEXT_PRIMARY,
     TEXT_SECONDARY,
+    _default_worker_count,
     _style_axes,
 )
 
@@ -121,13 +123,18 @@ def top_to_bottom_order(coords):
     return np.lexsort((coords[:, 0], coords[:, 1]))
 
 
-def collect(model, samples, coordinate_indices, device, n_random, rng, max_fixations, metric_kwargs,
-            coord_scale=1.0):
+def collect(model, samples, coordinate_indices, device, n_random, seed, max_fixations, metric_kwargs,
+            coord_scale=1.0, workers=1):
     """Returns `rows`: one dict per (sample, method, metric, param) with its value
     (for `random`, the mean over `n_random` draws). The model sees the coordinates as
     stored; the metrics see them divided by `coord_scale`, since their bounds and
-    `eps`/grid defaults assume `[0, 1]`."""
-    rows = []
+    `eps`/grid defaults assume `[0, 1]`.
+
+    Two phases: the model predicts every sample's order in this process (one forward
+    pass each, cheap), then the per-sample metric scoring -- the expensive, pure-Python
+    part -- runs on `workers` processes. Each sample's random baseline draws from its
+    own generator (`[seed, sample_index]`), so results don't depend on `workers`."""
+    tasks = []
     for item in samples:
         n = item["n_fixations"]
         if max_fixations is not None and n > max_fixations:
@@ -135,27 +142,51 @@ def collect(model, samples, coordinate_indices, device, n_random, rng, max_fixat
             continue
         shuffled = item["fixations"][:, coordinate_indices].numpy().astype(np.float64)
         coords = shuffled[item["inverse_permutation"].numpy()] / coord_scale  # true temporal order
-
         orders = {"model": predict_order(model, item, device), "top_to_bottom": top_to_bottom_order(coords)}
-        per_method = {name: evaluate_pair(coords, order, **metric_kwargs) for name, order in orders.items()}
+        tasks.append((len(tasks), item["id"], coords, orders, n_random, seed, metric_kwargs))
+    print(f"Predicted orders for {len(tasks)} samples; scoring on {workers} worker(s)")
 
-        random_vals = [evaluate_pair(coords, rng.permutation(n), **metric_kwargs) for _ in range(n_random)]
-        per_method["random"] = {
-            m: {label: float(np.nanmean([rv[m][label] for rv in random_vals])) for label in random_vals[0][m]}
-            for m in ALL_METRICS
-        }
+    if workers > 1:
+        ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context("spawn")
+        with ctx.Pool(processes=workers) as pool:
+            per_sample = list(pool.imap(_score_sample, tasks, chunksize=1))
+    else:
+        per_sample = [_score_sample(t) for t in tasks]
 
-        exact = float(np.mean(orders["model"] == np.arange(n)))
-        print(f"  {item['id']}: n={n}, model exact-position accuracy={exact:.3f}, "
-              f"kendall model/random = {per_method['model']['kendall_tau']['default']:.3f}/"
-              f"{per_method['random']['kendall_tau']['default']:.3f}")
-
-        for method, vals in per_method.items():
-            for m in ALL_METRICS:
-                for label, v in vals[m].items():
-                    rows.append({"sample": item["id"], "n": n, "method": method, "metric": m, "param": label,
-                                 "value": float(v)})
+    rows = []
+    for sample_rows, line in per_sample:
+        print(line)
+        rows.extend(sample_rows)
     return rows
+
+
+def _score_sample(task):
+    """Scores one sample's model and top-to-bottom orders, plus `n_random` random
+    orders (averaged), against its true order. Runs in a worker process under
+    `--workers > 1`. Returns `(rows, progress_line)`."""
+    sample_index, sample_id, coords, orders, n_random, seed, metric_kwargs = task
+    n = coords.shape[0]
+    rng = np.random.default_rng([seed, sample_index])
+    per_method = {name: evaluate_pair(coords, order, **metric_kwargs) for name, order in orders.items()}
+
+    random_vals = [evaluate_pair(coords, rng.permutation(n), **metric_kwargs) for _ in range(n_random)]
+    per_method["random"] = {
+        m: {label: float(np.nanmean([rv[m][label] for rv in random_vals])) for label in random_vals[0][m]}
+        for m in ALL_METRICS
+    }
+
+    exact = float(np.mean(orders["model"] == np.arange(n)))
+    line = (f"  {sample_id}: n={n}, model exact-position accuracy={exact:.3f}, "
+            f"kendall model/random = {per_method['model']['kendall_tau']['default']:.3f}/"
+            f"{per_method['random']['kendall_tau']['default']:.3f}")
+
+    rows = []
+    for method, vals in per_method.items():
+        for m in ALL_METRICS:
+            for label, v in vals[m].items():
+                rows.append({"sample": sample_id, "n": n, "method": method, "metric": m, "param": label,
+                             "value": float(v)})
+    return rows, line
 
 
 def summarize(rows):
@@ -251,6 +282,8 @@ def main():
     parser.add_argument("--eps-values", type=float, nargs="+", default=[0.025, 0.05, 0.1])
     parser.add_argument("--grid-sizes", type=int, nargs="+", default=[3, 5, 8])
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="processes for the metric scoring (default 1); 0 = every core this job has")
     parser.add_argument("--output-dir", default=os.path.join(PROJECT_ROOT, "work_dir", "metric_model_evaluation"))
     args = parser.parse_args()
 
@@ -268,8 +301,9 @@ def main():
     print(f"Evaluating {args.checkpoint} (epoch {state.get('epoch')}) on {args.h5_path}:{args.split}")
 
     metric_kwargs = dict(window_fracs=args.window_fracs, eps_values=args.eps_values, grid_sizes=args.grid_sizes)
-    rows = collect(model, samples, coordinate_indices, device, args.n_random,
-                   np.random.default_rng(args.seed), args.max_fixations, metric_kwargs, args.coord_scale)
+    workers = args.workers if args.workers > 0 else _default_worker_count()
+    rows = collect(model, samples, coordinate_indices, device, args.n_random, args.seed, args.max_fixations,
+                   metric_kwargs, args.coord_scale, workers)
 
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "per_sample.csv"), "w", newline="") as f:
