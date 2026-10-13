@@ -9,7 +9,7 @@
 #No GPU: model inference is cheap on cpu; the metrics run on all cpus
 #Expected runtime: ~1 h for TEST + TRAIN together; limit leaves margin
 #Note that a program will be killed once it exceeds this time!
-#SBATCH --time=0-04:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=slurm/outputs/metric-eval/metric-eval-log-%j.out
 #Skipping many options! see man sbatch
 # From here on, we can start our program
@@ -24,9 +24,9 @@
 # from its checkpoint and finished model evaluations are skipped.
 SPLITS=${@:-TEST TRAIN}
 
-H5=../erda2/eye-tracking/normalized_data_softGT_scaled20.h5   # relative to metric-evaluation/
-COORD_SCALE=20   # the scaled20 file stores coordinates x20; the metrics need [0, 1]
-CHECKPOINT=../work_dir/loss_ablation/doubly_stochastic_cross_entropy_soft/checkpoints/checkpoint_best.pt
+H5=../erda2/eye-tracking/normalized_data_softGT.h5   # relative to metric-evaluation/
+COORD_SCALE=1    # normalized_data_softGT.h5 stores [0, 1] coordinates (only *_scaled20.h5 needs 20)
+CHECKPOINT=../work_dir/loss_ablation_tau0.05_lr5e-3/doubly_stochastic_cross_entropy_soft/checkpoints/checkpoint_best.pt
 WORKERS=${SLURM_CPUS_PER_TASK:-1}
 
 module load python/3.12.8
@@ -41,8 +41,8 @@ cd metric-evaluation
 
 for SPLIT in $SPLITS; do
     split=$(echo "$SPLIT" | tr '[:upper:]' '[:lower:]')
-    DAMAGE_OUT=../work_dir/metric_damage_curves_scaled20_$split
-    MODEL_OUT=../work_dir/metric_model_evaluation_scaled20_$split
+    DAMAGE_OUT=../work_dir/metric_damage_curves_$split
+    MODEL_OUT=../work_dir/metric_model_evaluation_$split
 
     echo "=== $SPLIT: damage curves ($(date '+%H:%M:%S'))"
     # Full-length scanpaths (--max-fixations 0), the same ones the model is scored on.

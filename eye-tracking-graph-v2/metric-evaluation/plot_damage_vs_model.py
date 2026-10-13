@@ -30,7 +30,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from normalized_metrics import METRIC_GROUPS
-from run_damage_evaluation import AXIS_LINE, PAGE, PALETTE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, _style_axes
+from run_damage_evaluation import (
+    AXIS_LINE, DIRECTION_ARROW, DIRECTION_TEXT, HIGHER, LOWER, METRIC_DIRECTION, PAGE, PALETTE, TEXT_MUTED,
+    TEXT_PRIMARY, TEXT_SECONDARY, ZERO, _style_axes,
+)
 
 N_COLS = 6
 MODEL_COLOR = TEXT_PRIMARY
@@ -86,7 +89,8 @@ def plot_perturbation(pert_name, pert_results, summary, out_path, subtitle):
         top = max(np.nanmax(ys + sd), model, random)
         ax.set_ylim(0, top * 1.18 if top > 0 else 1)
         ax.set_xlim(-0.02, 1.02)
-        ax.set_title(metric if param == "default" else f"{metric} ({param})", fontsize=8, color=TEXT_PRIMARY,
+        title = metric if param == "default" else f"{metric} ({param})"
+        ax.set_title(f"{DIRECTION_ARROW[METRIC_DIRECTION[metric]]} {title}", fontsize=8, color=TEXT_PRIMARY,
                      loc="left")
         ax.tick_params(labelsize=6.5)
     for ax in axes[len(keys):]:
@@ -95,8 +99,10 @@ def plot_perturbation(pert_name, pert_results, summary, out_path, subtitle):
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper right", ncol=3, fontsize=8, frameon=False, labelcolor=TEXT_SECONDARY)
     fig.suptitle(f"Damage type: {pert_name}", fontsize=13, color=TEXT_PRIMARY, x=0.01, ha="left")
+    directions = {METRIC_DIRECTION[metric] for _, metric, _ in keys}
+    legend = "   ".join(f"{DIRECTION_ARROW[d]} = {DIRECTION_TEXT[d]}" for d in (HIGHER, LOWER, ZERO) if d in directions)
     fig.text(0.01, 0.955, subtitle + "  ·  x: severity level, y: dissimilarity (0 = identical order; "
-             "each panel has its own y-scale)", fontsize=8, color=TEXT_SECONDARY, ha="left")
+             "each panel has its own y-scale)  ·  " + legend, fontsize=8, color=TEXT_SECONDARY, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(out_path, dpi=140, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
